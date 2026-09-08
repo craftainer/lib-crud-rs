@@ -42,6 +42,7 @@ pub enum AppError {
     Forbidden(String),
     UnprocessableEntity(Vec<FieldError>),
     ServiceUnavailable(String),
+    TooManyRequests(String),
     Internal(String),
 }
 
@@ -81,6 +82,11 @@ impl IntoResponse for AppError {
             AppError::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable",
+                ProblemDetail_Detail::Text(msg),
+            ),
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too Many Requests",
                 ProblemDetail_Detail::Text(msg),
             ),
             AppError::Internal(msg) => {
@@ -203,6 +209,14 @@ mod tests {
             AppError::ServiceUnavailable("Authentication service unavailable".to_string())
                 .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_maps_to_429() {
+        let response = AppError::TooManyRequests("rate limit exceeded".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(response).await;
+        assert_eq!(body["detail"], "rate limit exceeded");
     }
 
     #[tokio::test]
