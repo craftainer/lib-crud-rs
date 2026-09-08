@@ -124,3 +124,121 @@ impl From<crate::repositories::RepoError> for AppError {
         AppError::Internal(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::FieldError;
+    use axum::body::to_bytes;
+    use std::sync::Mutex;
+
+    // configure_detail_redaction flips a process-wide static -- serialize
+    // any test that touches it, same pattern as config.rs's ENV_LOCK.
+    static REDACTION_LOCK: Mutex<()> = Mutex::new(());
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn not_found_maps_to_404_with_problem_json_content_type() {
+        let response = AppError::NotFound("hero 1 not found".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/problem+json"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["title"], "Not Found");
+        assert_eq!(body["status"], 404);
+        assert_eq!(body["detail"], "hero 1 not found");
+        assert_eq!(body["type"], "about:blank");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_maps_to_401_and_sets_www_authenticate() {
+        let response = AppError::Unauthorized("bad token".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn forbidden_maps_to_403_without_www_authenticate() {
+        let response = AppError::Forbidden("Insufficient role".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unprocessable_entity_serializes_field_errors_as_a_list() {
+        let response = AppError::UnprocessableEntity(vec![
+            FieldError::new("name", "must be 1-200 characters"),
+            FieldError::new("powers", "must contain at least one power"),
+        ])
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_json(response).await;
+        let detail = body["detail"].as_array().unwrap();
+        assert_eq!(detail.len(), 2);
+        assert_eq!(detail[0]["field"], "name");
+        assert_eq!(detail[1]["field"], "powers");
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_maps_to_503() {
+        let response =
+            AppError::ServiceUnavailable("Authentication service unavailable".to_string())
+                .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn internal_error_detail_is_redacted_outside_dev_mode() {
+        // into_response() is where redaction actually happens (it reads
+        // REDACT_INTERNAL_DETAIL synchronously) -- the guard only needs to
+        // span that call, not the later `.await` on the body, so it never
+        // crosses an await point (clippy::await_holding_lock).
+        let response = {
+            let _guard = REDACTION_LOCK.lock().unwrap();
+            configure_detail_redaction(Mode::Production);
+            let response = AppError::Internal("db pool exhausted: secret-ish detail".to_string())
+                .into_response();
+            configure_detail_redaction(Mode::Dev);
+            response
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(response).await;
+        assert_eq!(body["detail"], "Internal Server Error");
+    }
+
+    #[tokio::test]
+    async fn internal_error_detail_is_shown_in_dev_mode() {
+        let response = {
+            let _guard = REDACTION_LOCK.lock().unwrap();
+            configure_detail_redaction(Mode::Dev);
+            AppError::Internal("db pool exhausted".to_string()).into_response()
+        };
+        let body = body_json(response).await;
+        assert_eq!(body["detail"], "db pool exhausted");
+    }
+
+    #[test]
+    fn repo_error_converts_to_an_internal_app_error() {
+        let repo_err = crate::repositories::RepoError::Backend("connection reset".to_string());
+        let app_err: AppError = repo_err.into();
+        assert!(matches!(app_err, AppError::Internal(msg) if msg.contains("connection reset")));
+    }
+}
