@@ -21,7 +21,10 @@ mod common;
 use std::time::Duration;
 
 use common::{integration_settings, unique_suffix};
-use template_axum::events::{new_subscriber_id, CrudEvent, EventAction, EventBus, EventStream};
+use rumqttc::{AsyncClient, MqttOptions, QoS};
+use template_axum::events::{
+    new_subscriber_id, topic, CrudEvent, EventAction, EventBus, EventStream,
+};
 
 /// Long enough for a local broker round trip, short enough that a hung
 /// expectation fails the test rather than the harness timeout.
@@ -192,4 +195,82 @@ async fn a_subscriber_only_receives_its_own_resources_events() {
         "topics are per-resource, so the other resource's event never arrives here"
     );
     assert_eq!(event.ids, vec![2]);
+}
+
+#[tokio::test]
+async fn build_event_bus_connects_to_the_real_broker_outside_mode_mock() {
+    // `lib::build_event_bus`'s `Mode::Mock` branch has its own unit test
+    // (`src/lib.rs`'s colocated `mod tests`); only the real-broker branch
+    // needs live Mosquitto.
+    let mut settings = integration_settings();
+    settings.mode = template_axum::config::Mode::Dev;
+    let bus = template_axum::build_event_bus(&settings);
+
+    let resource = format!("heroes-it-{}", unique_suffix());
+    let mut stream = bus
+        .subscribe(&resource, &new_subscriber_id())
+        .await
+        .unwrap();
+    settle(&mut stream).await;
+    bus.publish(CrudEvent::new(&resource, EventAction::Create, vec![42]))
+        .await;
+    assert_eq!(
+        next_within(&mut stream, RECEIVE_TIMEOUT).await.unwrap().ids,
+        vec![42]
+    );
+}
+
+#[tokio::test]
+async fn a_subscriber_skips_an_undecodable_payload_and_keeps_streaming() {
+    let resource = format!("heroes-it-{}", unique_suffix());
+    let bus = broker();
+    let mut stream = bus
+        .subscribe(&resource, &new_subscriber_id())
+        .await
+        .expect("the devcontainer stack's Mosquitto must be running");
+    settle(&mut stream).await;
+
+    // A raw client, bypassing EventBus::publish entirely, so it can put
+    // a payload on the topic that isn't valid `CrudEvent` JSON at all --
+    // something no caller going through the public API could ever send.
+    let settings = integration_settings();
+    let mut options = MqttOptions::new(
+        format!("crud-events-garbage-publisher-{}", new_subscriber_id()),
+        settings.mqtt_host,
+        settings.mqtt_port,
+    );
+    options.set_clean_session(true);
+    let (raw_publisher, mut raw_eventloop) = AsyncClient::new(options, 8);
+    tokio::spawn(async move {
+        loop {
+            if raw_eventloop.poll().await.is_err() {
+                return;
+            }
+        }
+    });
+    // Let the eventloop task actually connect before publishing, and again
+    // after, so the garbage payload is on the wire (and, being QoS 1,
+    // acknowledged) before the legitimate event below -- two publishes
+    // from different client connections have no ordering guarantee
+    // otherwise, and this test only means anything if the garbage one
+    // arrives first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    raw_publisher
+        .publish(
+            topic(&resource),
+            QoS::AtLeastOnce,
+            false,
+            b"not json".to_vec(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    bus.publish(CrudEvent::new(&resource, EventAction::Create, vec![7]))
+        .await;
+
+    let event = next_within(&mut stream, RECEIVE_TIMEOUT)
+        .await
+        .expect("the undecodable payload must be skipped, not tear down the stream");
+    assert_eq!(event.ids, vec![7]);
 }
