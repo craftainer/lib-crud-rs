@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::config::Mode;
-use crate::views::FieldError;
+use crate::generic::views::FieldError;
 
 /// RFC 9457 body shape -- `type`/`title`/`status`/`detail`/`instance`.
 #[derive(Debug, Serialize)]
@@ -125,8 +125,8 @@ impl IntoResponse for AppError {
     }
 }
 
-impl From<crate::repositories::RepoError> for AppError {
-    fn from(err: crate::repositories::RepoError) -> Self {
+impl From<crate::generic::repositories::RepoError> for AppError {
+    fn from(err: crate::generic::repositories::RepoError) -> Self {
         AppError::Internal(err.to_string())
     }
 }
@@ -134,7 +134,7 @@ impl From<crate::repositories::RepoError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::FieldError;
+    use crate::generic::views::FieldError;
     use axum::body::to_bytes;
     use std::sync::Mutex;
 
@@ -251,7 +251,8 @@ mod tests {
 
     #[test]
     fn repo_error_converts_to_an_internal_app_error() {
-        let repo_err = crate::repositories::RepoError::Backend("connection reset".to_string());
+        let repo_err =
+            crate::generic::repositories::RepoError::Backend("connection reset".to_string());
         let app_err: AppError = repo_err.into();
         assert!(matches!(app_err, AppError::Internal(msg) if msg.contains("connection reset")));
     }
