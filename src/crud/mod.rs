@@ -8,8 +8,8 @@
 //! only knows the generic parameters `M`/`C`/`U` its `Repository` impl
 //! carries (`docs/nfrs/0004-generic-crud-excludes-resource-logic.md`).
 
-use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
-use crate::repositories::{ListOptions, RepoError, Repository};
+use crate::generic::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
+use crate::generic::repositories::{ListOptions, RepoError, Repository};
 
 /// The default `?limit=` when a caller supplies none.
 pub const DEFAULT_LIMIT: u64 = 100;
