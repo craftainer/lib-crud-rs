@@ -39,8 +39,40 @@
 
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS};
 use tokio::sync::broadcast;
+
+/// Abstraction over `rumqttc::EventLoop::poll`, so `EventStream::Mqtt`
+/// can be driven by a test-only fake that returns a scripted sequence of
+/// poll errors -- the only way to deterministically exercise
+/// `next_event`'s backoff/reconnect-limit branches without actually
+/// breaking the shared Mosquitto container mid-suite, which would risk
+/// flaking every other MQTT test running concurrently.
+#[async_trait::async_trait]
+pub trait MqttPoll: Send {
+    async fn poll(&mut self) -> Result<Event, ConnectionError>;
+}
+
+#[async_trait::async_trait]
+impl MqttPoll for EventLoop {
+    async fn poll(&mut self) -> Result<Event, ConnectionError> {
+        EventLoop::poll(self).await
+    }
+}
+
+/// Keeps the publisher's own MQTT event loop turning so queued publishes
+/// actually leave the process (`EventBus::connect`'s own doc comment) --
+/// runs forever in production; a test drives it against a fake that
+/// answers one scripted error and then pends forever, bounded by a
+/// `tokio::time::timeout`.
+async fn drive_publisher_eventloop(eventloop: &mut dyn MqttPoll) {
+    loop {
+        if let Err(err) = eventloop.poll().await {
+            tracing::warn!("mqtt publisher connection error: {err}");
+            tokio::time::sleep(POLL_ERROR_BACKOFF).await;
+        }
+    }
+}
 
 /// Root of the topic tree every resource's events publish under, matching
 /// the reference implementation's `crud-events/<resource>`.
@@ -62,7 +94,13 @@ const CHANNEL_CAPACITY: usize = 64;
 /// the poll loop; without any tolerance, a single blip would drop every
 /// open stream.
 const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
+#[cfg(not(test))]
 const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+// A few milliseconds under test, so the backoff/reconnect-limit tests
+// below don't spend real seconds sleeping -- same idea as
+// `crud_events.rs`'s `KEEP_ALIVE_INTERVAL` cfg override.
+#[cfg(test)]
+const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(1);
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 
@@ -166,6 +204,15 @@ pub fn new_subscriber_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Logs a CRUD event's serialization failure and drops the publish --
+/// see `EventBus::publish`'s own doc comment for why this never
+/// propagates to the caller. `CrudEvent` is owned scalars, so this branch
+/// never actually fires in practice; it's still tested directly rather
+/// than left unreachable.
+fn log_and_skip_publish(err: serde_json::Error) {
+    tracing::error!("failed to serialize CRUD event: {err}");
+}
+
 /// Something went wrong opening a subscriber's stream.
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
@@ -213,14 +260,7 @@ impl EventBus {
         // leaves the process while something polls it. Nothing consumes
         // incoming packets on the publisher connection, so this task just
         // keeps it turning and logs failures.
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = eventloop.poll().await {
-                    tracing::warn!("mqtt publisher connection error: {err}");
-                    tokio::time::sleep(POLL_ERROR_BACKOFF).await;
-                }
-            }
-        });
+        tokio::spawn(async move { drive_publisher_eventloop(&mut eventloop).await });
 
         Self {
             backend: Backend::Mqtt {
@@ -249,10 +289,7 @@ impl EventBus {
             Backend::Mqtt { publisher, .. } => {
                 let payload = match serde_json::to_vec(&event) {
                     Ok(payload) => payload,
-                    Err(err) => {
-                        tracing::error!("failed to serialize CRUD event: {err}");
-                        return;
-                    }
+                    Err(err) => return log_and_skip_publish(err),
                 };
                 if let Err(err) = publisher
                     .publish(topic(&event.resource), QoS::AtLeastOnce, false, payload)
@@ -317,7 +354,7 @@ impl EventBus {
 pub enum EventStream {
     Mqtt {
         _client: AsyncClient,
-        eventloop: Box<EventLoop>,
+        eventloop: Box<dyn MqttPoll>,
         consecutive_errors: u32,
     },
     Mock {
@@ -415,6 +452,12 @@ mod tests {
     #[test]
     fn new_subscriber_ids_are_unique() {
         assert_ne!(new_subscriber_id(), new_subscriber_id());
+    }
+
+    #[test]
+    fn log_and_skip_publish_does_not_panic() {
+        let err = serde_json::from_str::<i32>("bad").unwrap_err();
+        log_and_skip_publish(err);
     }
 
     #[test]
@@ -537,5 +580,97 @@ mod tests {
         }
         let event = stream.next_event().await.unwrap();
         assert_eq!(event.action, EventAction::Create);
+    }
+
+    /// Returns a scripted sequence of poll results -- the only
+    /// deterministic way to drive `EventStream::next_event`'s MQTT
+    /// backoff/reconnect-limit branches, which only run against a broken
+    /// broker connection (see `MqttPoll`'s own doc comment).
+    struct ScriptedEventLoop {
+        responses: std::collections::VecDeque<Result<Event, ConnectionError>>,
+    }
+
+    impl ScriptedEventLoop {
+        fn new(responses: Vec<Result<Event, ConnectionError>>) -> Self {
+            Self {
+                responses: responses.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MqttPoll for ScriptedEventLoop {
+        async fn poll(&mut self) -> Result<Event, ConnectionError> {
+            self.responses
+                .pop_front()
+                .expect("ScriptedEventLoop's scripted responses were exhausted")
+        }
+    }
+
+    fn mqtt_stream_with(responses: Vec<Result<Event, ConnectionError>>) -> EventStream {
+        let options = MqttOptions::new("test-client", "localhost", 1883);
+        let (client, _real_eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        EventStream::Mqtt {
+            _client: client,
+            eventloop: Box::new(ScriptedEventLoop::new(responses)),
+            consecutive_errors: 0,
+        }
+    }
+
+    fn publish_event(event: &CrudEvent) -> Event {
+        Event::Incoming(Packet::Publish(rumqttc::Publish::new(
+            topic(&event.resource),
+            QoS::AtLeastOnce,
+            serde_json::to_vec(event).unwrap(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn mqtt_stream_backs_off_and_recovers_from_fewer_than_max_consecutive_errors() {
+        let event = CrudEvent::new("heroes", EventAction::Create, vec![9]);
+        let mut stream = mqtt_stream_with(vec![
+            Err(ConnectionError::NetworkTimeout),
+            Err(ConnectionError::NetworkTimeout),
+            Ok(publish_event(&event)),
+        ]);
+        let received = stream.next_event().await.unwrap();
+        assert_eq!(received.ids, vec![9]);
+    }
+
+    #[tokio::test]
+    async fn mqtt_stream_ends_after_max_consecutive_poll_errors() {
+        let mut responses = Vec::with_capacity(MAX_CONSECUTIVE_POLL_ERRORS as usize);
+        for _ in 0..MAX_CONSECUTIVE_POLL_ERRORS {
+            responses.push(Err(ConnectionError::NetworkTimeout));
+        }
+        let mut stream = mqtt_stream_with(responses);
+        assert!(stream.next_event().await.is_none());
+    }
+
+    /// One scripted error, then pends forever -- for
+    /// `drive_publisher_eventloop`'s infinite loop, which a test can only
+    /// ever observe a bounded prefix of.
+    struct FirstErrorThenPendingForever(Option<ConnectionError>);
+
+    #[async_trait::async_trait]
+    impl MqttPoll for FirstErrorThenPendingForever {
+        async fn poll(&mut self) -> Result<Event, ConnectionError> {
+            match self.0.take() {
+                Some(err) => Err(err),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_publisher_eventloop_logs_and_backs_off_on_a_poll_error() {
+        let mut eventloop = FirstErrorThenPendingForever(Some(ConnectionError::NetworkTimeout));
+        // The loop never returns on its own; give it just long enough to
+        // take the error branch once before cutting it off.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            drive_publisher_eventloop(&mut eventloop),
+        )
+        .await;
     }
 }
