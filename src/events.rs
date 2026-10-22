@@ -27,12 +27,20 @@
 //! `crud-events-<resource>-<id>`.
 //!
 //! Every connection that has to be given a fresh id is *anonymous* and
-//! creates a persistent session on the broker that outlives it. They are
-//! capped ([`EventBus::with_max_anonymous_connections`]): over the cap
+//! leaves a persistent session on the broker behind it. The number of
+//! anonymous streams open at once is capped
+//! ([`EventBus::with_max_anonymous_connections`]): over the cap
 //! [`EventBus::subscribe`] fails with
-//! [`EventError::TooManyAnonymousConnections`] rather than letting
-//! unauthenticated callers fill the broker with sessions. A client that
-//! resumes with its id is not counted.
+//! [`EventError::TooManyAnonymousConnections`], so unauthenticated callers
+//! cannot hold unlimited connections and tasks. A client that resumes with its
+//! id is not counted. The cap is a backstop with two limits to know about.
+//! It counts *open* streams, not the sessions they leave: a caller that
+//! connects, disconnects and repeats is bounded by the broker's own session
+//! expiry (`persistent_client_expiration`), not by this cap. And it is one
+//! budget for the whole bus, so a caller holding that many idle streams can
+//! refuse every first-time subscriber; per-client limits (by IP or by
+//! credential) belong in the host's rate limiter or reverse proxy, in front of
+//! the events route.
 //!
 //! ## Delivery guarantee (MQTT bus, and its exact scope)
 //!
@@ -208,6 +216,9 @@ const SUBSCRIBER_ID_LEN: usize = 2 * (NONCE_BYTES + TAG_BYTES);
 
 /// Bytes of the random per-bus secret used when the host supplies none.
 const SECRET_BYTES: usize = 32;
+
+/// The shortest secret [`EventBus::with_subscriber_secret`] accepts.
+pub const MIN_SUBSCRIBER_SECRET_LEN: usize = 32;
 
 /// How many anonymous connections a bus allows at once unless the host
 /// says otherwise.
@@ -481,10 +492,21 @@ impl EventBus {
     /// restarts, and is unknown to every other instance behind a load
     /// balancer, so a reconnecting client lands on a fresh session. A host
     /// that wants resume across restarts and instances gives every instance
-    /// the same secret (at least 32 random bytes, kept like any signing key).
+    /// the same secret, kept like any signing key.
+    ///
+    /// # Panics
+    ///
+    /// If `secret` is shorter than [`MIN_SUBSCRIBER_SECRET_LEN`] bytes: a
+    /// short or empty key (an unset environment variable read with a default,
+    /// say) would make every id forgeable.
     #[must_use]
     pub fn with_subscriber_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
-        self.secret = secret.into();
+        let secret = secret.into();
+        assert!(
+            secret.len() >= MIN_SUBSCRIBER_SECRET_LEN,
+            "the subscriber secret must be at least {MIN_SUBSCRIBER_SECRET_LEN} bytes"
+        );
+        self.secret = secret;
         self
     }
 
@@ -858,6 +880,12 @@ mod tests {
         let b = EventBus::mock().with_subscriber_secret(b"k".repeat(32));
         let id = a.mint_subscriber_id("widgets");
         assert!(b.verify_subscriber_id("widgets", &id).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 32 bytes")]
+    fn a_short_subscriber_secret_is_refused() {
+        let _ = EventBus::mock().with_subscriber_secret(Vec::new());
     }
 
     #[test]

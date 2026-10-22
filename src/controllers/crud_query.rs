@@ -154,7 +154,15 @@ fn cast_one(kind: FieldKind, raw: &str) -> Option<FilterValue> {
     match kind {
         FieldKind::String => Some(FilterValue::Str(raw.to_string())),
         FieldKind::Number => raw.trim().parse::<i64>().ok().map(FilterValue::Int),
-        FieldKind::Float => raw.trim().parse::<f64>().ok().map(FilterValue::Float),
+        // Finite only: Python's `float()` also takes `nan`/`inf`, but a NaN
+        // bound into SQL compares greater than every number and turns a
+        // range filter (or a bulk target) into the wrong set.
+        FieldKind::Float => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(FilterValue::Float),
         FieldKind::DateTime => cast_datetime(raw.trim()).map(FilterValue::DateTime),
         FieldKind::Boolean => match raw.trim().to_lowercase().as_str() {
             "true" | "1" => Some(FilterValue::Bool(true)),
@@ -442,8 +450,10 @@ mod tests {
     fn an_integer_field_still_rejects_a_decimal_value() {
         let errors = parse_filters(SPECS, &params(&[("power_level", "1.5")])).unwrap_err();
         assert_eq!(errors.len(), 1);
-        let errors = parse_filters(SPECS, &params(&[("score", "abc")])).unwrap_err();
-        assert_eq!(errors.len(), 1);
+        for bad in ["abc", "NaN", "inf", "-infinity", "1e999"] {
+            let errors = parse_filters(SPECS, &params(&[("score", bad)])).unwrap_err();
+            assert_eq!(errors.len(), 1, "{bad}");
+        }
     }
 
     #[test]

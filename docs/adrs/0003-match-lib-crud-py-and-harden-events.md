@@ -24,7 +24,7 @@ have. They are recorded under Decision so the next reader does not "fix" them.
 
 - Subscriber ids are minted by the server and verified, never chosen by the
   client: 128 random bits plus a 128-bit HMAC-SHA256 tag over the resource and
-  those bits, keyed by a per-bus secret (`EventBus::with_subscriber_secret` to
+  those bits, keyed by a per-bus secret (`EventBus::with_subscriber_secret`, at least 32 bytes, to
   share it across restarts and instances). `EventBus::subscribe` resumes an id
   only if its tag verifies for that resource, otherwise it mints a new one.
   This closes session takeover through a guessed or low-entropy id; Python
@@ -34,11 +34,13 @@ have. They are recorded under Decision so the next reader does not "fix" them.
 - Ids are scoped per resource: the tag covers the resource, and the MQTT client
   id is `crud-events-<resource>-<id>` (as in Python).
 - Connections that need a freshly minted id ("anonymous") are capped
-  (`with_max_anonymous_connections`, default 256) and fail with
-  `EventError::TooManyAnonymousConnections`, rendered as `429`. Each one leaves
-  a persistent session on the broker, so an unbounded count is a resource leak
-  any unauthenticated caller can drive. Resuming with an issued id is not
-  counted.
+  (`with_max_anonymous_connections`, default 256 open at once) and fail with
+  `EventError::TooManyAnonymousConnections`, rendered as `429`. The cap bounds
+  open streams (connections and tasks); it does not bound the persistent
+  sessions they leave on the broker, which the broker's own
+  `persistent_client_expiration` does, and it is one budget for the bus, so
+  per-client limits stay with the host's rate limiter. Resuming with an issued
+  id is not counted.
 - `subscribe` waits for the broker's CONNACK and SUBACK. A broker that is down
   or refuses the subscription is a `503` at subscribe time rather than an
   open stream that never delivers. Events replayed by a resumed session before
@@ -62,7 +64,9 @@ have. They are recorded under Decision so the next reader does not "fix" them.
   clause order, error order and which duplicate won depend on hashing.
 - `FieldKind::Float`, `FieldSpec::float` and `FilterValue::Float`: Python casts
   with the field's own `int`/`float` type, so a decimal is valid for a float
-  field and a 422 for an integer one. `Number` keeps meaning integer. Float
+  field and a 422 for an integer one. Unlike Python, `nan` and `inf` are a 422:
+  a NaN bound into SQL sorts above every number and would turn a range filter
+  or a bulk target into the wrong set. `Number` keeps meaning integer. Float
   fields take part in stats and predict like integers.
 - `RESERVED_PARAMS` is public and complete per the manifest:
   `skip`, `limit`, `sort`, `id`, `include_archived`, `include_unpublished`.
