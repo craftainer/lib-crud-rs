@@ -4,8 +4,6 @@
 
 mod support;
 
-use std::collections::HashMap;
-
 use craftainer_crud::controllers::crud_actions::{
     DeleteOutcome, ListOrGet, UpdateOutcome, resolve_delete, resolve_list_or_get, resolve_update,
     resolve_update_by_id,
@@ -25,7 +23,7 @@ const SPECS: &[FieldSpec] = &[
     FieldSpec::boolean("in_stock"),
 ];
 
-fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -303,6 +301,51 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
     };
     assert_eq!(result.matched, 3);
     assert_eq!(service.count(&[], false).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_float_filter_compares_against_the_stored_column() {
+    let service = seeded().await;
+    let float_specs = [FieldSpec::float("quantity"), FieldSpec::string("name")];
+    let clauses = parse_filters(&float_specs, &params(&[("quantity__min", "6.5")])).unwrap();
+    let found = service.list(0, 100, false, clauses, vec![]).await.unwrap();
+    assert_eq!(names(&found), ["gadget", "Sprocket"]);
+}
+
+#[tokio::test]
+async fn an_id_wins_over_filters_like_lib_crud_py() {
+    let service = seeded().await;
+    let all = service.list(0, 100, false, vec![], vec![]).await.unwrap();
+    let id = all[0].id;
+    // A filter that cannot match the record is ignored, not a 422 and not
+    // an extra condition: `?id=` addresses the record by itself.
+    let never = filters(&[("quantity__min", "1000")]);
+
+    let ListOrGet::One(one) =
+        resolve_list_or_get(&service, Some(id), 0, 10, false, never.clone(), vec![])
+            .await
+            .unwrap()
+    else {
+        panic!("expected one record");
+    };
+    assert_eq!(one.id, id);
+
+    let patch = WidgetPatch {
+        name: Some("renamed".to_string()),
+        quantity: None,
+    };
+    assert!(matches!(
+        resolve_update(&service, Some(id), "alice", never.clone(), patch, 10)
+            .await
+            .unwrap(),
+        UpdateOutcome::One(_)
+    ));
+    assert!(matches!(
+        resolve_delete(&service, Some(id), "alice", never, 10)
+            .await
+            .unwrap(),
+        DeleteOutcome::One
+    ));
 }
 
 #[tokio::test]

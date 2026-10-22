@@ -132,6 +132,7 @@ fn push_value(builder: &mut QueryBuilder<Postgres>, value: &FilterValue) -> Resu
     match value {
         FilterValue::Str(v) => builder.push_bind(v.clone()),
         FilterValue::Int(v) => builder.push_bind(*v),
+        FilterValue::Float(v) => builder.push_bind(*v),
         FilterValue::DateTime(v) => builder.push_bind(*v),
         FilterValue::Bool(v) => builder.push_bind(*v),
         FilterValue::List(_) => return Err(RepoError::Backend("nested list".to_string())),

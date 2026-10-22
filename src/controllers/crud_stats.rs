@@ -60,14 +60,14 @@ impl TimeBucket {
     }
 }
 
-/// Fields eligible for numeric stats/predict: `FieldKind::Number` only --
-/// `FieldKind::DateTime` is excluded (averaging or summing a timestamp has no
-/// sensible meaning as an aggregate statistic).
+/// Fields eligible for numeric stats/predict: `FieldKind::Number` and
+/// `FieldKind::Float` -- `FieldKind::DateTime` is excluded (averaging or
+/// summing a timestamp has no sensible meaning as an aggregate statistic).
 #[must_use]
 pub fn numeric_fields(specs: &[FieldSpec]) -> Vec<&'static str> {
     specs
         .iter()
-        .filter(|spec| spec.kind == FieldKind::Number)
+        .filter(|spec| matches!(spec.kind, FieldKind::Number | FieldKind::Float))
         .map(|spec| spec.name)
         .collect()
 }
@@ -87,30 +87,36 @@ pub fn categorical_fields(specs: &[FieldSpec]) -> Vec<&'static str> {
 /// are: `value_of` is the one place a caller's per-field access becomes
 /// concrete (mirrors that resource's own `numeric_value`/`boolean_value`
 /// helpers).
+///
+/// The order is deterministic and is `lib-crud-py`'s in-memory one: fields in
+/// the order of `fields`, and within a field its values in order of first
+/// appearance in `records`.
 pub fn categorical_counts<T>(
     records: &[T],
     fields: &[&'static str],
     value_of: impl Fn(&T, &str) -> Option<bool>,
 ) -> Vec<crate::views::stats::CategoricalValueCount> {
-    fields
-        .iter()
-        .flat_map(|&field| {
-            let mut counts: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            for record in records {
-                if let Some(value) = value_of(record, field) {
-                    *counts.entry(value.to_string()).or_insert(0) += 1;
-                }
+    let mut rows = Vec::new();
+    for &field in fields {
+        let mut counts: Vec<(String, u64)> = Vec::new();
+        for record in records {
+            let Some(value) = value_of(record, field).map(|value| value.to_string()) else {
+                continue;
+            };
+            match counts.iter_mut().find(|(seen, _)| *seen == value) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((value, 1)),
             }
-            counts.into_iter().map(move |(value, count)| {
-                crate::views::stats::CategoricalValueCount {
-                    field,
-                    value,
-                    count,
-                }
-            })
-        })
-        .collect()
+        }
+        rows.extend(counts.into_iter().map(|(value, count)| {
+            crate::views::stats::CategoricalValueCount {
+                field,
+                value,
+                count,
+            }
+        }));
+    }
+    rows
 }
 
 /// Parse an optional `?bucket=` value.
@@ -232,6 +238,13 @@ pub struct InsufficientHistory {
 
 /// Project `periods` future buckets via ordinary-least-squares linear
 /// regression. `series` must already be ordered oldest-first.
+///
+/// The regression is over the position of each point in `series` (0, 1, 2,
+/// ...), not over its `bucket_start`, exactly as `lib-crud-py`'s `forecast`
+/// does, so both servers return the same numbers for the same series. A
+/// series with empty buckets in the middle (a day with no records, which
+/// neither server zero-fills) is therefore treated as if the gap were not
+/// there; a caller that wants the gap to count passes a zero-filled series.
 ///
 /// # Errors
 ///
@@ -373,6 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn forecast_regresses_on_series_position_not_on_bucket_time_like_python() {
+        // Values 0, 1, 2 on days 1, 2 and 10: positions 0..3, so the next
+        // point is 3.0, whatever the calendar gap.
+        let series: Vec<BucketValue> = [(1, 0.0), (2, 1.0), (10, 2.0)]
+            .iter()
+            .map(|&(day, value)| BucketValue {
+                bucket_start: dt(2027, 1, day),
+                value,
+            })
+            .collect();
+        let predictions = forecast(&series, 1, TimeBucket::Day).unwrap();
+        assert!((predictions[0].value - 3.0).abs() < 1e-9);
+        assert_eq!(predictions[0].bucket_start, dt(2027, 1, 11));
+    }
+
+    #[test]
     fn forecast_handles_a_flat_series_with_zero_slope() {
         let series: Vec<BucketValue> = (0..3)
             .map(|i| BucketValue {
@@ -403,6 +432,8 @@ mod tests {
             FieldSpec::datetime("created_at"),
         ];
         assert_eq!(numeric_fields(specs), vec!["id"]);
+        let with_float = &[FieldSpec::number("id"), FieldSpec::float("score")];
+        assert_eq!(numeric_fields(with_float), vec!["id", "score"]);
         assert_eq!(categorical_fields(specs), vec!["is_locked"]);
     }
 
@@ -416,16 +447,38 @@ mod tests {
             Record { is_locked: true },
             Record { is_locked: false },
         ];
-        let mut counts = categorical_counts(&records, &["is_locked"], |record, _field| {
+        let counts = categorical_counts(&records, &["is_locked"], |record, _field| {
             Some(record.is_locked)
         });
-        counts.sort_by(|a, b| a.value.cmp(&b.value));
+        // First-seen order, with no sorting by the test.
         assert_eq!(counts.len(), 2);
         assert_eq!(counts[0].field, "is_locked");
-        assert_eq!(counts[0].value, "false");
-        assert_eq!(counts[0].count, 1);
-        assert_eq!(counts[1].value, "true");
-        assert_eq!(counts[1].count, 2);
+        assert_eq!(counts[0].value, "true");
+        assert_eq!(counts[0].count, 2);
+        assert_eq!(counts[1].value, "false");
+        assert_eq!(counts[1].count, 1);
+    }
+
+    #[test]
+    fn categorical_counts_order_is_fields_then_first_seen_on_every_run() {
+        let records: Vec<(bool, bool)> = (0..40).map(|i| (i % 3 == 0, i % 2 == 0)).collect();
+        let run = || {
+            categorical_counts(&records, &["a", "b"], |record, field| {
+                Some(if field == "a" { record.0 } else { record.1 })
+            })
+            .into_iter()
+            .map(|row| (row.field, row.value, row.count))
+            .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            ("a", "true".to_string(), 14),
+            ("a", "false".to_string(), 26),
+            ("b", "true".to_string(), 20),
+            ("b", "false".to_string(), 20),
+        ];
+        for _ in 0..20 {
+            assert_eq!(run(), expected);
+        }
     }
 
     #[test]

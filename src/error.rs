@@ -49,6 +49,10 @@ pub enum CrudError {
     /// (HTTP 503).
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// The caller is over a limit the layer enforces, for example the cap on
+    /// anonymous event streams (HTTP 429).
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
     /// Anything else, typically a storage failure (HTTP 500). The detail is
     /// redacted in the response unless [`configure_detail_redaction`] turned
     /// redaction off.
@@ -58,6 +62,11 @@ pub enum CrudError {
 
 static REDACT_INTERNAL_DETAIL: AtomicBool = AtomicBool::new(true);
 
+// configure_detail_redaction flips a process-wide static -- serialize any
+// test, in any module, that touches it.
+#[cfg(test)]
+pub(crate) static REDACTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Choose whether [`CrudError::Internal`] responses hide their message.
 ///
 /// Redaction is on by default. A host calls this once at startup, typically
@@ -65,6 +74,19 @@ static REDACT_INTERNAL_DETAIL: AtomicBool = AtomicBool::new(true);
 /// production client.
 pub fn configure_detail_redaction(redact: bool) {
     REDACT_INTERNAL_DETAIL.store(redact, Ordering::Relaxed);
+}
+
+/// `detail` when [`configure_detail_redaction`] has turned redaction off,
+/// otherwise the generic `hidden` text: for a detail that comes from
+/// infrastructure (a broker address, a driver message) rather than from the
+/// caller's own request.
+#[must_use]
+pub fn redacted_detail(detail: String, hidden: &str) -> String {
+    if REDACT_INTERNAL_DETAIL.load(Ordering::Relaxed) {
+        hidden.to_string()
+    } else {
+        detail
+    }
 }
 
 impl IntoResponse for CrudError {
@@ -81,13 +103,14 @@ impl IntoResponse for CrudError {
                 "Service Unavailable",
                 Detail::Text(msg),
             ),
+            Self::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too Many Requests",
+                Detail::Text(msg),
+            ),
             Self::Internal(msg) => {
                 tracing::error!(error = %msg, "unhandled internal error");
-                let detail = if REDACT_INTERNAL_DETAIL.load(Ordering::Relaxed) {
-                    "Internal Server Error".to_string()
-                } else {
-                    msg
-                };
+                let detail = redacted_detail(msg, "Internal Server Error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal Server Error",
@@ -119,13 +142,9 @@ impl From<RepoError> for CrudError {
 
 #[cfg(test)]
 mod tests {
+    use super::REDACTION_LOCK;
     use super::*;
     use axum::body::to_bytes;
-    use std::sync::Mutex;
-
-    // configure_detail_redaction flips a process-wide static -- serialize
-    // any test that touches it, same pattern as config.rs's ENV_LOCK.
-    static REDACTION_LOCK: Mutex<()> = Mutex::new(());
 
     async fn body_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -171,6 +190,22 @@ mod tests {
             CrudError::ServiceUnavailable("Authentication service unavailable".to_string())
                 .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_maps_to_429() {
+        let response = CrudError::TooManyRequests("slow down".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_json(response).await["detail"], "slow down");
+    }
+
+    #[test]
+    fn redacted_detail_follows_the_redaction_switch() {
+        let _guard = REDACTION_LOCK.lock().unwrap();
+        configure_detail_redaction(true);
+        assert_eq!(redacted_detail("secret".to_string(), "hidden"), "hidden");
+        configure_detail_redaction(false);
+        assert_eq!(redacted_detail("secret".to_string(), "hidden"), "secret");
     }
 
     #[tokio::test]

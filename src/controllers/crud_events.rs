@@ -7,8 +7,8 @@
 //! resource's router composes, not a router of its own, so a second resource
 //! gets the same endpoint by adding one route and one `&'static str`.
 //!
-//! See [`crate::events`] for the transport and the delivery guarantee's
-//! exact scope.
+//! See [`crate::events`] for the transport, how subscriber ids are minted and
+//! verified, and the delivery guarantee's exact scope.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -19,16 +19,13 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 
-use crate::error::CrudError;
-use crate::events::{
-    CrudEvent, EventAction, EventBus, EventError, EventStream, new_subscriber_id,
-    sanitize_subscriber_id,
-};
+use crate::error::{CrudError, redacted_detail};
+use crate::events::{CrudEvent, EventAction, EventBus, EventError, EventStream};
 
 /// The header a browser's `EventSource` resends automatically after a
-/// dropped connection -- the stream puts the `subscriber_id` in every frame's
-/// `id:` field precisely so that automatic resend is enough to resume the
-/// persistent session, with no client-side bookkeeping.
+/// dropped connection -- the stream puts the server-minted `subscriber_id` in
+/// every frame's `id:` field precisely so that automatic resend is enough to
+/// resume the persistent session, with no client-side bookkeeping.
 const LAST_EVENT_ID: &str = "last-event-id";
 
 /// How often a comment frame is sent on an idle stream, to keep proxies and
@@ -49,23 +46,29 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(20);
 /// is lost by erasing the rest of it here.
 pub type EventSse = Response;
 
-/// Pick the `subscriber_id` this connection resumes (or starts).
+/// Pick the `subscriber_id` this connection asks to resume.
 ///
 /// Precedence: the explicit `?subscriber_id=` query parameter, then the
-/// `Last-Event-ID` header, then a freshly issued id. An id that fails
-/// `sanitize_subscriber_id` is treated as absent rather than as an error --
-/// a client sending garbage gets a working stream with a new id, not a 400
-/// it cannot act on. The cost is stated plainly in the FR: no replay.
-pub fn resolve_subscriber_id(requested: Option<&str>, headers: &HeaderMap) -> String {
-    requested
-        .and_then(sanitize_subscriber_id)
-        .or_else(|| {
-            headers
-                .get(LAST_EVENT_ID)
-                .and_then(|value| value.to_str().ok())
-                .and_then(sanitize_subscriber_id)
-        })
-        .unwrap_or_else(new_subscriber_id)
+/// `Last-Event-ID` header. A candidate counts only if `bus` minted it for
+/// `resource` ([`EventBus::verify_subscriber_id`]); one that does not verify
+/// is treated as absent rather than as an error -- a client sending garbage
+/// gets a working stream under a new server-minted id, not a 400 it cannot
+/// act on. The cost is stated plainly in the FR: no replay. `None` means
+/// "mint a fresh id".
+#[must_use]
+pub fn resolve_subscriber_id(
+    bus: &EventBus,
+    resource: &str,
+    requested: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<String> {
+    let from_header = headers
+        .get(LAST_EVENT_ID)
+        .and_then(|value| value.to_str().ok());
+    [requested, from_header]
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| bus.verify_subscriber_id(resource, candidate))
 }
 
 /// The stream's first frame: the `subscriber_id` this connection was given,
@@ -107,24 +110,43 @@ fn error_frame(err: impl std::fmt::Display) -> SseEvent {
 /// # Errors
 ///
 /// [`CrudError::ServiceUnavailable`] when the bus cannot open the
-/// subscription (for example the broker is down).
+/// subscription (for example the broker is down; the broker's own message is
+/// hidden unless [`configure_detail_redaction`](crate::error::configure_detail_redaction)
+/// turned redaction off), and [`CrudError::TooManyRequests`] when the bus's
+/// cap on anonymous streams is reached.
 pub async fn event_stream(
     bus: &EventBus,
     resource: &'static str,
     requested_subscriber_id: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<EventSse, CrudError> {
-    let subscriber_id = resolve_subscriber_id(requested_subscriber_id, headers);
-    let stream = bus.subscribe(resource, &subscriber_id).await;
-    into_sse(subscriber_id, stream)
+    let requested = resolve_subscriber_id(bus, resource, requested_subscriber_id, headers);
+    let opened = bus.subscribe(resource, requested.as_deref()).await;
+    into_sse(opened)
 }
 
-/// The response for a resolved subscription, or the 503 for a failed one.
-fn into_sse(
-    subscriber_id: String,
-    stream: Result<EventStream, EventError>,
-) -> Result<EventSse, CrudError> {
-    let stream = stream.map_err(|err| CrudError::ServiceUnavailable(err.to_string()))?;
+/// The CRUD error for a failed subscription. The broker's message can carry
+/// its address or driver internals, so it is logged and only shown when
+/// redaction is off.
+fn subscribe_error(err: EventError) -> CrudError {
+    match err {
+        EventError::TooManyAnonymousConnections => CrudError::TooManyRequests(
+            "too many anonymous event streams; resume with the subscriber_id you were issued"
+                .to_string(),
+        ),
+        EventError::Broker(detail) => {
+            tracing::warn!("event stream unavailable: {detail}");
+            CrudError::ServiceUnavailable(redacted_detail(
+                detail,
+                "event stream temporarily unavailable",
+            ))
+        }
+    }
+}
+
+/// The response for a resolved subscription, or the error for a failed one.
+fn into_sse(opened: Result<(String, EventStream), EventError>) -> Result<EventSse, CrudError> {
+    let (subscriber_id, stream) = opened.map_err(subscribe_error)?;
     Ok(sse_from(subscriber_id, stream))
 }
 
@@ -159,6 +181,7 @@ pub async fn publish(bus: &EventBus, resource: &str, action: EventAction, ids: V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{REDACTION_LOCK, configure_detail_redaction};
     use axum::http::HeaderValue;
 
     fn headers_with_last_event_id(value: &str) -> HeaderMap {
@@ -168,54 +191,90 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_subscription_becomes_a_503() {
-        let err = into_sse(
-            "sub".to_string(),
-            Err(EventError::Broker("broker down".to_string())),
-        )
+    fn a_failed_subscription_becomes_a_503_with_the_broker_detail_redacted() {
+        let _guard = REDACTION_LOCK.lock().unwrap();
+        configure_detail_redaction(true);
+        let err = into_sse(Err(EventError::Broker(
+            "tcp connect error to mqtt.internal:1883".to_string(),
+        )))
         .unwrap_err();
-        assert!(matches!(err, CrudError::ServiceUnavailable(msg) if msg.contains("broker down")));
+        assert!(
+            matches!(&err, CrudError::ServiceUnavailable(msg) if !msg.contains("mqtt.internal")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_broker_detail_is_shown_when_redaction_is_off() {
+        let _guard = REDACTION_LOCK.lock().unwrap();
+        configure_detail_redaction(false);
+        let err = into_sse(Err(EventError::Broker("broker down".to_string()))).unwrap_err();
+        configure_detail_redaction(true);
+        assert!(matches!(err, CrudError::ServiceUnavailable(msg) if msg == "broker down"));
+    }
+
+    #[test]
+    fn hitting_the_anonymous_cap_becomes_a_429() {
+        let err = into_sse(Err(EventError::TooManyAnonymousConnections)).unwrap_err();
+        assert!(matches!(err, CrudError::TooManyRequests(_)));
     }
 
     #[test]
     fn an_explicit_query_parameter_wins() {
-        let headers = headers_with_last_event_id("from-header");
+        let bus = EventBus::mock();
+        let from_query = bus.mint_subscriber_id("widgets");
+        let from_header = bus.mint_subscriber_id("widgets");
+        let headers = headers_with_last_event_id(&from_header);
         assert_eq!(
-            resolve_subscriber_id(Some("from-query"), &headers),
-            "from-query"
+            resolve_subscriber_id(&bus, "widgets", Some(&from_query), &headers),
+            Some(from_query)
         );
     }
 
     #[test]
     fn the_last_event_id_header_is_used_when_no_query_parameter_is_given() {
-        let headers = headers_with_last_event_id("from-header");
-        assert_eq!(resolve_subscriber_id(None, &headers), "from-header");
-    }
-
-    #[test]
-    fn a_fresh_id_is_issued_when_neither_source_supplies_one() {
-        let issued = resolve_subscriber_id(None, &HeaderMap::new());
+        let bus = EventBus::mock();
+        let from_header = bus.mint_subscriber_id("widgets");
+        let headers = headers_with_last_event_id(&from_header);
         assert_eq!(
-            sanitize_subscriber_id(&issued).as_deref(),
-            Some(issued.as_str())
+            resolve_subscriber_id(&bus, "widgets", None, &headers),
+            Some(from_header)
         );
     }
 
     #[test]
-    fn an_invalid_query_parameter_falls_back_to_the_header() {
-        let headers = headers_with_last_event_id("from-header");
+    fn nothing_is_resumed_when_neither_source_supplies_an_id() {
+        let bus = EventBus::mock();
         assert_eq!(
-            resolve_subscriber_id(Some("bad/id"), &headers),
-            "from-header"
+            resolve_subscriber_id(&bus, "widgets", None, &HeaderMap::new()),
+            None
         );
     }
 
     #[test]
-    fn an_invalid_id_from_both_sources_yields_a_fresh_one() {
+    fn an_unminted_query_parameter_falls_back_to_the_header() {
+        let bus = EventBus::mock();
+        let from_header = bus.mint_subscriber_id("widgets");
+        let headers = headers_with_last_event_id(&from_header);
+        assert_eq!(
+            resolve_subscriber_id(&bus, "widgets", Some("victim"), &headers),
+            Some(from_header)
+        );
+    }
+
+    #[test]
+    fn ids_that_were_not_minted_for_this_resource_resume_nothing() {
+        let bus = EventBus::mock();
+        let other_resource = bus.mint_subscriber_id("gadgets");
         let headers = headers_with_last_event_id("also/bad");
-        let issued = resolve_subscriber_id(Some(""), &headers);
-        assert!(sanitize_subscriber_id(&issued).is_some());
-        assert_ne!(issued, "also/bad");
+        assert_eq!(
+            resolve_subscriber_id(&bus, "widgets", Some(&other_resource), &headers),
+            None
+        );
+        assert_eq!(
+            resolve_subscriber_id(&bus, "widgets", Some(""), &headers),
+            None
+        );
     }
 
     #[test]
@@ -225,39 +284,84 @@ mod tests {
             LAST_EVENT_ID,
             HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
         );
-        let issued = resolve_subscriber_id(None, &headers);
-        assert!(sanitize_subscriber_id(&issued).is_some());
+        let bus = EventBus::mock();
+        assert_eq!(resolve_subscriber_id(&bus, "widgets", None, &headers), None);
+    }
+
+    #[tokio::test]
+    async fn a_client_chosen_id_is_replaced_by_a_minted_one() {
+        let bus = EventBus::mock();
+        let response = event_stream(&bus, "widgets", Some("victim"), &HeaderMap::new())
+            .await
+            .unwrap();
+        let body = first_frames(response, 1).await;
+        assert!(!body.contains("victim"), "{body}");
+        assert!(body.contains("event: subscriber"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_anonymous_cap_stops_new_streams_but_not_resuming_ones() {
+        let bus = EventBus::mock().with_max_anonymous_connections(1);
+        let first = event_stream(&bus, "widgets", None, &HeaderMap::new())
+            .await
+            .unwrap();
+        let err = event_stream(&bus, "widgets", None, &HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CrudError::TooManyRequests(_)));
+        let issued = first_frames(first, 1).await;
+        let id = issued
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .unwrap()
+            .to_string();
+        assert!(
+            event_stream(&bus, "widgets", Some(&id), &HeaderMap::new())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn the_first_frame_carries_the_subscriber_id() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", Some("sub-1"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", None, &HeaderMap::new())
             .await
             .unwrap();
         let body = first_frames(response, 1).await;
         assert!(body.contains("event: subscriber"), "{body}");
-        assert!(body.contains("id: sub-1"), "{body}");
-        assert!(body.contains(r#"{"subscriber_id":"sub-1"}"#), "{body}");
+        let id = body
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .unwrap();
+        assert!(bus.verify_subscriber_id("widgets", id).is_some(), "{body}");
+        assert!(
+            body.contains(&format!(r#"{{"subscriber_id":"{id}"}}"#)),
+            "{body}"
+        );
     }
 
     #[tokio::test]
     async fn published_events_become_frames_named_after_the_action() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", Some("sub-2"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", None, &HeaderMap::new())
             .await
             .unwrap();
         publish(&bus, "widgets", EventAction::Create, vec![42]).await;
         let body = first_frames(response, 2).await;
         assert!(body.contains("event: create"), "{body}");
         assert!(body.contains(r#""ids":[42]"#), "{body}");
-        assert!(body.contains("id: sub-2"), "{body}");
+        let id = body
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .unwrap();
+        assert_eq!(body.matches(&format!("id: {id}")).count(), 2, "{body}");
     }
 
     #[tokio::test]
     async fn the_stream_ends_when_the_bus_goes_away() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", Some("sub-3"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", None, &HeaderMap::new())
             .await
             .unwrap();
         drop(bus);
@@ -271,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn keep_alive_comments_are_skipped_before_the_first_real_event() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", Some("sub-4"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", None, &HeaderMap::new())
             .await
             .unwrap();
         let publish_after_a_few_keep_alives = async {

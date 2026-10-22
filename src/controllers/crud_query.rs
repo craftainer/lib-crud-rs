@@ -9,11 +9,20 @@
 //! descending.
 //!
 //! There is no `field__regex=` (see [`crate::repositories::filtering`]) and
-//! no enum field kind. [`FieldKind`] splits `Number` from `DateTime` rather
-//! than using one "number" kind that dispatches on a runtime type.
-
-use std::collections::HashMap;
-use std::hash::BuildHasher;
+//! no enum field kind. [`FieldKind`] splits `Number` (integers), `Float` and
+//! `DateTime` rather than using one "number" kind that dispatches on a
+//! runtime type; Python's `lib-crud-py` makes the same split by casting with
+//! the field's own `int`/`float` type, so `1.5` is a valid value for a
+//! `Float` field and a 422 for a `Number` one.
+//!
+//! # Order
+//!
+//! Params are a slice of `(key, value)` pairs in the order they appear on
+//! the wire (an Axum handler extracts them with
+//! `Query<Vec<(String, String)>>`), not a map: a repeated key is a repeated
+//! clause, clauses come back in request order and so do errors, which is what
+//! `lib-crud-py` does (`QueryParams.multi_items()`). A hash map would make
+//! both depend on hashing.
 
 use chrono::{NaiveDateTime, Utc};
 
@@ -21,15 +30,28 @@ use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortCl
 use crate::views::FieldError;
 
 /// Query params never treated as a filter/sort key, regardless of a
-/// resource's own field table.
-const RESERVED_PARAMS: &[&str] = &["id", "skip", "limit", "sort", "include_archived"];
+/// resource's own field table: the six reserved keys of the CRUD manifest
+/// (`skip`, `limit`, `sort`, `id`, `include_archived`, `include_unpublished`).
+/// `include_unpublished` is reserved even though this crate has no draft or
+/// schedule lifecycle, so a client built for the manifest can send it to any
+/// server of the family.
+pub const RESERVED_PARAMS: &[&str] = &[
+    "id",
+    "skip",
+    "limit",
+    "sort",
+    "include_archived",
+    "include_unpublished",
+];
 
 /// What "kind" a filterable field is, driving which operators it accepts
 /// and how a raw query-string value is cast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
-    /// An integer or floating-point number.
+    /// An integer.
     Number,
+    /// A floating-point number.
+    Float,
     /// A timestamp.
     DateTime,
     /// Free text.
@@ -54,6 +76,14 @@ impl FieldSpec {
         Self {
             name,
             kind: FieldKind::Number,
+        }
+    }
+    /// A floating-point field.
+    #[must_use]
+    pub const fn float(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: FieldKind::Float,
         }
     }
     /// A timestamp field.
@@ -84,7 +114,7 @@ impl FieldSpec {
 
 fn ops_for(kind: FieldKind) -> &'static [&'static str] {
     match kind {
-        FieldKind::Number | FieldKind::DateTime => &["eq", "min", "max", "in"],
+        FieldKind::Number | FieldKind::Float | FieldKind::DateTime => &["eq", "min", "max", "in"],
         FieldKind::String => &["eq", "contains", "icontains"],
         FieldKind::Boolean => &["eq", "in"],
     }
@@ -124,6 +154,7 @@ fn cast_one(kind: FieldKind, raw: &str) -> Option<FilterValue> {
     match kind {
         FieldKind::String => Some(FilterValue::Str(raw.to_string())),
         FieldKind::Number => raw.trim().parse::<i64>().ok().map(FilterValue::Int),
+        FieldKind::Float => raw.trim().parse::<f64>().ok().map(FilterValue::Float),
         FieldKind::DateTime => cast_datetime(raw.trim()).map(FilterValue::DateTime),
         FieldKind::Boolean => match raw.trim().to_lowercase().as_str() {
             "true" | "1" => Some(FilterValue::Bool(true)),
@@ -140,16 +171,17 @@ fn cast_one(kind: FieldKind, raw: &str) -> Option<FilterValue> {
 ///
 /// # Errors
 ///
-/// Every offending parameter, as [`FieldError`]s; a caller wraps them in
+/// Every offending parameter, in request order, as [`FieldError`]s; a caller wraps them in
 /// [`CrudError::UnprocessableEntity`](crate::error::CrudError::UnprocessableEntity).
-pub fn parse_filters<S: BuildHasher>(
+pub fn parse_filters<K: AsRef<str>, V: AsRef<str>>(
     specs: &[FieldSpec],
-    params: &HashMap<String, String, S>,
+    params: &[(K, V)],
 ) -> Result<Vec<FilterClause>, Vec<FieldError>> {
     let mut clauses = Vec::new();
     let mut errors = Vec::new();
     for (key, raw) in params {
-        if RESERVED_PARAMS.contains(&key.as_str()) {
+        let (key, raw) = (key.as_ref(), raw.as_ref());
+        if RESERVED_PARAMS.contains(&key) {
             continue;
         }
         let (field, suffix) = split_key(key);
@@ -213,11 +245,17 @@ pub fn parse_filters<S: BuildHasher>(
 /// # Errors
 ///
 /// Every unrecognized sort field, as [`FieldError`]s.
-pub fn parse_sort<S: BuildHasher>(
+pub fn parse_sort<K: AsRef<str>, V: AsRef<str>>(
     specs: &[FieldSpec],
-    params: &HashMap<String, String, S>,
+    params: &[(K, V)],
 ) -> Result<Vec<SortClause>, Vec<FieldError>> {
-    let Some(raw) = params.get("sort") else {
+    // The last `sort` wins, as `QueryParams.get` does in `lib-crud-py`.
+    let Some(raw) = params
+        .iter()
+        .rev()
+        .find(|(key, _)| key.as_ref() == "sort")
+        .map(|(_, value)| value.as_ref())
+    else {
         return Ok(vec![]);
     };
     let mut clauses = Vec::new();
@@ -257,12 +295,13 @@ mod tests {
     const SPECS: &[FieldSpec] = &[
         FieldSpec::number("id"),
         FieldSpec::number("power_level"),
+        FieldSpec::float("score"),
         FieldSpec::string("name"),
         FieldSpec::datetime("created_at"),
         FieldSpec::boolean("is_locked"),
     ];
 
-    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -354,12 +393,104 @@ mod tests {
                 ("skip", "5"),
                 ("limit", "10"),
                 ("include_archived", "true"),
+                ("include_unpublished", "true"),
+                ("sort", "name"),
             ]),
         )
         .unwrap();
         // "id" here is ambiguous with the reserved param of the same name --
         // RESERVED_PARAMS wins, so it's never parsed as a filter.
         assert_eq!(clauses, Vec::<FilterClause>::new());
+    }
+
+    #[test]
+    fn every_manifest_reserved_key_is_reserved() {
+        for key in [
+            "skip",
+            "limit",
+            "sort",
+            "id",
+            "include_archived",
+            "include_unpublished",
+        ] {
+            assert!(RESERVED_PARAMS.contains(&key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_float_field_accepts_decimal_values_in_every_operator() {
+        let clauses = parse_filters(
+            SPECS,
+            &params(&[
+                ("score", "1.5"),
+                ("score__min", "-0.25"),
+                ("score__max", "1e3"),
+                ("score__in", "1,2.5"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(clauses[0].value, FilterValue::Float(1.5));
+        assert_eq!(clauses[1].value, FilterValue::Float(-0.25));
+        assert_eq!(clauses[2].value, FilterValue::Float(1000.0));
+        assert_eq!(
+            clauses[3].value,
+            FilterValue::List(vec![FilterValue::Float(1.0), FilterValue::Float(2.5)])
+        );
+    }
+
+    #[test]
+    fn an_integer_field_still_rejects_a_decimal_value() {
+        let errors = parse_filters(SPECS, &params(&[("power_level", "1.5")])).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        let errors = parse_filters(SPECS, &params(&[("score", "abc")])).unwrap_err();
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn clauses_and_errors_come_back_in_request_order() {
+        let pairs = [
+            ("name", "a"),
+            ("id__max", "9"),
+            ("nope", "1"),
+            ("id__min", "1"),
+            ("bad", "2"),
+            ("is_locked", "true"),
+        ];
+        let clauses =
+            parse_filters(SPECS, &params(&[pairs[0], pairs[1], pairs[3], pairs[5]])).unwrap();
+        let keys: Vec<_> = clauses.iter().map(|c| (c.field.as_str(), c.op)).collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("name", FilterOp::Eq),
+                ("id", FilterOp::Lte),
+                ("id", FilterOp::Gte),
+                ("is_locked", FilterOp::Eq),
+            ]
+        );
+        let errors = parse_filters(SPECS, &params(&pairs)).unwrap_err();
+        let messages: Vec<_> = errors.iter().map(|e| e.msg.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "unrecognized filter \"nope\"",
+                "unrecognized filter \"bad\""
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_is_a_repeated_clause() {
+        let clauses = parse_filters(SPECS, &params(&[("id__min", "1"), ("id__min", "5")])).unwrap();
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[1].value, FilterValue::Int(5));
+    }
+
+    #[test]
+    fn the_last_sort_param_wins() {
+        let clauses = parse_sort(SPECS, &params(&[("sort", "name"), ("sort", "-id")])).unwrap();
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].field, "id");
     }
 
     #[test]

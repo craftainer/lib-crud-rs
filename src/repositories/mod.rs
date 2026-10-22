@@ -42,6 +42,43 @@ pub enum RepoError {
 
 /// Storage-agnostic CRUD access for one resource. Every mutating method
 /// takes `owner_id`: reads are open, writes are always scoped to the caller.
+///
+/// # The `owner_id` filter contract
+///
+/// `update` and `delete` receive the owner as an argument. `update_many` and
+/// `delete_many` receive none: [`CrudService`](crate::crud::CrudService)
+/// appends one extra clause to the caller's filters instead,
+///
+/// ```text
+/// FilterClause { field: "owner_id", op: FilterOp::Eq, value: FilterValue::Str(owner) }
+/// ```
+///
+/// and the same clause is added to the `filters` of the `count` that sizes a
+/// bulk action. An implementation therefore must:
+///
+/// - treat a clause whose `field` is `"owner_id"` as a comparison against the
+///   column or attribute that holds the record's owner, whatever it is
+///   called in storage (the name `owner_id` is the filter vocabulary, not a
+///   schema requirement);
+/// - apply it like any other clause, and never drop, reorder past or
+///   special-case it: an implementation that ignores an unknown field would
+///   let a bulk action touch every owner's records;
+/// - fail with [`RepoError::Backend`] rather than ignore the clause when the
+///   resource has no owner column.
+///
+/// A resource that wants its owner column to be a query filter lists it in
+/// its [`FieldSpec`](crate::controllers::crud_query::FieldSpec) table;
+/// otherwise the only `owner_id` clause a repository sees is the one the
+/// service appends.
+///
+/// # Bulk actions are not atomic with their cap
+///
+/// The cap on a bulk action is checked with `count` before `update_many` or
+/// `delete_many` runs (see
+/// [`crud_actions`](crate::controllers::crud_actions)). This trait has no
+/// "at most N rows" write, so the two steps are separate and the cap can be
+/// exceeded by a concurrent insert. An implementation that must enforce a
+/// hard limit does so itself, inside its write.
 #[async_trait]
 pub trait Repository: Send + Sync {
     /// The read model a record is returned as.
@@ -59,7 +96,8 @@ pub trait Repository: Send + Sync {
     async fn list(&self, opts: ListOptions) -> Result<Vec<Self::Model>, RepoError>;
 
     /// How many non-archived (unless `include_archived`) rows match
-    /// `filters`; used to cap a bulk update/delete before it runs.
+    /// `filters`; used to cap a bulk update/delete before it runs. `filters`
+    /// carry the `owner_id` clause described on [`Repository`].
     ///
     /// # Errors
     ///
