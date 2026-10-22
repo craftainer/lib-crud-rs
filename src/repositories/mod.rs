@@ -1,26 +1,11 @@
-//! The generic half of storage-agnostic CRUD access, backing `crud`. See
-//! `docs/adrs/0001-mvc-layering-with-a-generic-crud-interface.md` for why
-//! this layer exists as a trait with two implementations per resource
-//! (SeaORM-backed, in-memory) rather than one hand-written per-resource
-//! data-access class. Hero's own implementations live in
-//! `crate::hero::repositories`.
+//! The generic half of storage-agnostic CRUD access, backing
+//! [`CrudService`](crate::crud::CrudService).
 //!
-//! Rust-specific deviation from the Python original's `Repository`
-//! protocol (documented in that ADR's port): Python's `SQLAlchemyRepository`
-//! is generic over *any* mapped model at runtime, because SQLAlchemy's
-//! `Base.registry` and Python's dynamic attribute access let one class
-//! introspect an arbitrary model's columns. SeaORM's `EntityTrait` is
-//! statically generated per entity, so a single Rust `impl` cannot be
-//! generic over "any SeaORM entity" without unwieldy trait-bound
-//! machinery. Instead, `Repository` is generic via **associated types**
-//! (read model `Model`, create payload `Create`, update payload `Update`),
-//! and each resource provides one small `impl` per backend (SeaORM +
-//! in-memory) that maps those types onto its own entity's columns.
-//! `crud::CrudService<R>` itself stays fully generic and contains zero
-//! resource-specific code -- the same payoff `NFR-0004`
-//! (`docs/nfrs/0004-generic-crud-excludes-resource-logic.md`) describes,
-//! just with the entity-specific column mapping living one layer lower
-//! than in the Python original.
+//! [`Repository`] is generic through **associated types** (read model
+//! `Model`, create payload `Create`, update payload `Update`) rather than
+//! being generic over "any table": each resource provides one small
+//! implementation per backend that maps those types onto its own storage.
+//! `CrudService<R>` itself then stays free of resource-specific code.
 
 pub mod filtering;
 
@@ -28,15 +13,19 @@ use async_trait::async_trait;
 
 use filtering::{FilterClause, SortClause};
 
-/// Pagination/visibility/filter/sort options shared by every resource's
-/// `list` -- `filters`/`sort` added by `docs/adrs/0013` (Tier C item 3).
+/// Pagination, visibility, filter and sort options shared by every
+/// resource's `list`.
 #[derive(Debug, Clone, Default)]
 pub struct ListOptions {
+    /// Records to skip.
     pub skip: u64,
+    /// Maximum records to return.
     pub limit: u64,
-    /// Include soft-deleted (`archived_at IS NOT NULL`) rows -- ADR 0012.
+    /// Include soft-deleted (archived) rows.
     pub include_archived: bool,
+    /// Conditions every returned record satisfies.
     pub filters: Vec<FilterClause>,
+    /// Sort order, most significant first.
     pub sort: Vec<SortClause>,
 }
 
@@ -46,50 +35,94 @@ pub struct ListOptions {
 /// error) from "the backend itself failed".
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
+    /// The storage backend failed.
     #[error("backend error: {0}")]
     Backend(String),
 }
 
 /// Storage-agnostic CRUD access for one resource. Every mutating method
-/// takes `owner_id`: reads are open (Hero's `OwnerScope(read_scoped=
-/// false)`, ADR 0011), writes are always scoped to the caller.
+/// takes `owner_id`: reads are open, writes are always scoped to the caller.
 #[async_trait]
 pub trait Repository: Send + Sync {
+    /// The read model a record is returned as.
     type Model: Send + Sync;
+    /// The payload that creates a record.
     type Create: Send + Sync;
+    /// The (partial) payload that updates a record.
     type Update: Send + Sync;
 
+    /// One page of records matching `opts`.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn list(&self, opts: ListOptions) -> Result<Vec<Self::Model>, RepoError>;
+
     /// How many non-archived (unless `include_archived`) rows match
-    /// `filters` -- used to cap a bulk update/delete before it runs
-    /// (`docs/adrs/0013`), same role as `count()` in the reference.
+    /// `filters`; used to cap a bulk update/delete before it runs.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn count(
         &self,
         filters: &[FilterClause],
         include_archived: bool,
     ) -> Result<u64, RepoError>;
+
+    /// Record `id`, or `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn get(&self, id: i32, include_archived: bool) -> Result<Option<Self::Model>, RepoError>;
+
+    /// Create a record owned by `owner_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn create(&self, owner_id: &str, data: Self::Create) -> Result<Self::Model, RepoError>;
-    /// `None` if no row matched `id` (not found or not owned by `owner_id`).
+
+    /// Update record `id`; `None` if no row matched (not found or not owned
+    /// by `owner_id`).
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn update(
         &self,
         id: i32,
         owner_id: &str,
         data: Self::Update,
     ) -> Result<Option<Self::Model>, RepoError>;
+
     /// Apply `data` to every non-archived row matching `filters`; returns
     /// the updated rows.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn update_many(
         &self,
         filters: &[FilterClause],
         data: Self::Update,
     ) -> Result<Vec<Self::Model>, RepoError>;
-    /// `false` if no row matched `id` (not found, not owned, or already
-    /// archived).
+
+    /// Soft-delete record `id`; `false` if no row matched (not found, not
+    /// owned, or already archived).
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn delete(&self, id: i32, owner_id: &str) -> Result<bool, RepoError>;
+
     /// Soft-delete every non-archived row matching `filters`; returns the
-    /// rows that were deleted (post-delete state, matching the
-    /// reference's `delete_many`).
+    /// rows that were deleted (post-delete state).
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     async fn delete_many(&self, filters: &[FilterClause]) -> Result<Vec<Self::Model>, RepoError>;
 }
 
@@ -97,43 +130,43 @@ pub trait Repository: Send + Sync {
 /// limitation -- `Box<dyn Repository<...> + '_>` ends up "not general
 /// enough" wherever the resulting type is used through another generic
 /// bound) that defines a concrete, boxed-trait-object-backed `Repository`
-/// for one resource. Lets a resource's own `AppState` (e.g.
-/// `crate::hero::controllers::AppState`) hold one `CrudService<
-/// DynXRepository>` field whose concrete backend (SeaORM vs. in-memory)
-/// was picked once at startup based on `Mode`, instead of a
-/// generic-over-backend `AppState` (which axum's `State` extractor can't
+/// for one resource. Lets the host's application state hold one
+/// `CrudService<DynXRepository>` field whose concrete backend (SQL vs.
+/// in-memory) was picked once at startup, instead of a
+/// generic-over-backend state type (which axum's `State` extractor can't
 /// express) or two parallel router trees.
 #[macro_export]
 macro_rules! dyn_repository {
     ($name:ident, model = $model:ty, create = $create:ty, update = $update:ty) => {
+        /// A boxed, type-erased `Repository`, generated by `dyn_repository!`.
         pub struct $name(
             pub  Box<
-                dyn $crate::generic::repositories::Repository<
-                    Model = $model,
-                    Create = $create,
-                    Update = $update,
-                >,
+                dyn $crate::repositories::Repository<
+                        Model = $model,
+                        Create = $create,
+                        Update = $update,
+                    >,
             >,
         );
 
-        #[async_trait::async_trait]
-        impl $crate::generic::repositories::Repository for $name {
+        #[$crate::async_trait::async_trait]
+        impl $crate::repositories::Repository for $name {
             type Model = $model;
             type Create = $create;
             type Update = $update;
 
             async fn list(
                 &self,
-                opts: $crate::generic::repositories::ListOptions,
-            ) -> Result<Vec<$model>, $crate::generic::repositories::RepoError> {
+                opts: $crate::repositories::ListOptions,
+            ) -> Result<Vec<$model>, $crate::repositories::RepoError> {
                 self.0.list(opts).await
             }
 
             async fn count(
                 &self,
-                filters: &[$crate::generic::repositories::filtering::FilterClause],
+                filters: &[$crate::repositories::filtering::FilterClause],
                 include_archived: bool,
-            ) -> Result<u64, $crate::generic::repositories::RepoError> {
+            ) -> Result<u64, $crate::repositories::RepoError> {
                 self.0.count(filters, include_archived).await
             }
 
@@ -141,7 +174,7 @@ macro_rules! dyn_repository {
                 &self,
                 id: i32,
                 include_archived: bool,
-            ) -> Result<Option<$model>, $crate::generic::repositories::RepoError> {
+            ) -> Result<Option<$model>, $crate::repositories::RepoError> {
                 self.0.get(id, include_archived).await
             }
 
@@ -149,7 +182,7 @@ macro_rules! dyn_repository {
                 &self,
                 owner_id: &str,
                 data: $create,
-            ) -> Result<$model, $crate::generic::repositories::RepoError> {
+            ) -> Result<$model, $crate::repositories::RepoError> {
                 self.0.create(owner_id, data).await
             }
 
@@ -158,15 +191,15 @@ macro_rules! dyn_repository {
                 id: i32,
                 owner_id: &str,
                 data: $update,
-            ) -> Result<Option<$model>, $crate::generic::repositories::RepoError> {
+            ) -> Result<Option<$model>, $crate::repositories::RepoError> {
                 self.0.update(id, owner_id, data).await
             }
 
             async fn update_many(
                 &self,
-                filters: &[$crate::generic::repositories::filtering::FilterClause],
+                filters: &[$crate::repositories::filtering::FilterClause],
                 data: $update,
-            ) -> Result<Vec<$model>, $crate::generic::repositories::RepoError> {
+            ) -> Result<Vec<$model>, $crate::repositories::RepoError> {
                 self.0.update_many(filters, data).await
             }
 
@@ -174,14 +207,14 @@ macro_rules! dyn_repository {
                 &self,
                 id: i32,
                 owner_id: &str,
-            ) -> Result<bool, $crate::generic::repositories::RepoError> {
+            ) -> Result<bool, $crate::repositories::RepoError> {
                 self.0.delete(id, owner_id).await
             }
 
             async fn delete_many(
                 &self,
-                filters: &[$crate::generic::repositories::filtering::FilterClause],
-            ) -> Result<Vec<$model>, $crate::generic::repositories::RepoError> {
+                filters: &[$crate::repositories::filtering::FilterClause],
+            ) -> Result<Vec<$model>, $crate::repositories::RepoError> {
                 self.0.delete_many(filters).await
             }
         }

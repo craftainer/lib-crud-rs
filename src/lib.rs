@@ -1,59 +1,39 @@
-//! Example library crate: a tiny, fully tested public API to replace.
+//! Generic async CRUD layer for Axum services.
+//!
+//! The crate is the resource-agnostic half of a CRUD service: everything a
+//! host application needs to expose records over HTTP except the records
+//! themselves. A host supplies one [`repositories::Repository`]
+//! implementation per resource (any storage), and this crate supplies:
+//!
+//! - [`crud::CrudService`], a thin service over any repository;
+//! - [`repositories::filtering`], the storage-agnostic filter and sort
+//!   vocabulary, and [`controllers::crud_query`], which parses a query string
+//!   into it from a per-resource field table;
+//! - [`controllers::crud_actions`], the list-or-get, update and delete
+//!   decision logic, including bulk actions with a size cap;
+//! - [`controllers::crud_stats`] and [`views::stats`], the building blocks of
+//!   stats and prediction endpoints;
+//! - [`events`] and [`controllers::crud_events`], a publish/subscribe bus and
+//!   its Server-Sent Events stream (the broker-backed bus is behind the
+//!   `mqtt` feature);
+//! - [`error::CrudError`], the error type all of the above return, rendered as
+//!   RFC 9457 `application/problem+json`.
+//!
+//! No part of it knows about a concrete resource, an authentication scheme
+//! or a database.
+//!
+//! # Features
+//!
+//! - `mqtt`: [`events::EventBus::connect`], an MQTT-backed bus with
+//!   persistent subscriber sessions. Without it only the in-memory bus
+//!   ([`events::EventBus::mock`]) exists.
 
-use std::fmt;
+pub mod controllers;
+pub mod crud;
+pub mod error;
+pub mod events;
+pub mod models;
+pub mod repositories;
+pub mod views;
 
-/// Why [`greet`] refused its input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GreetError {
-    /// The name was empty or only whitespace.
-    EmptyName,
-}
-
-impl fmt::Display for GreetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyName => f.write_str("name must not be empty"),
-        }
-    }
-}
-
-impl std::error::Error for GreetError {}
-
-/// Builds a greeting for `name`.
-///
-/// # Errors
-///
-/// Returns [`GreetError::EmptyName`] when `name` is empty or only whitespace.
-///
-/// # Examples
-///
-/// ```
-/// assert_eq!(template_rust_crate::greet("Ada").unwrap(), "Hello, Ada!");
-/// ```
-pub fn greet(name: &str) -> Result<String, GreetError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(GreetError::EmptyName);
-    }
-    Ok(format!("Hello, {name}!"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn greets_a_name() {
-        assert_eq!(greet("  Ada ").unwrap(), "Hello, Ada!");
-    }
-
-    #[test]
-    fn rejects_blank_names() {
-        assert_eq!(greet(" ").unwrap_err(), GreetError::EmptyName);
-    }
-
-    #[test]
-    fn error_displays_a_message() {
-        assert_eq!(GreetError::EmptyName.to_string(), "name must not be empty");
-    }
-}
+pub use async_trait;

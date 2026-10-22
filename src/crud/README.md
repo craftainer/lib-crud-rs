@@ -1,25 +1,15 @@
 # crud/
 
-The generic CRUD interface: `CrudService<R>`, built from any `R:
-Repository`. Contains zero resource-specific code
-(`docs/nfrs/0004-generic-crud-excludes-resource-logic.md`) — a resource
-that needs genuinely bespoke query logic (a business-rule search
-endpoint, a multi-step workflow) adds it directly in its own controller
-against its own `Repository` impl, not by extending `CrudService`.
+`CrudService<R>`, a thin service over any `R: Repository`. It contains no
+resource-specific code: a resource that needs bespoke query logic adds it in
+its own controller against its own repository, not by extending the service.
 
-`docs/adrs/0013` narrows that guidance the same way template-fastapi's
-own `docs/adrs/0008` narrows its Python equivalent: filter/sort/bulk
-support that's *mechanically derivable* from a resource's own DTO (a
-numeric field always gets `eq`/`min`/`max`/`in`, a string field always
-gets `eq`/`contains`/`icontains`, and so on) belongs here instead,
-since a per-resource implementation would just mean re-deriving the
-same logic in every controller. `CrudService::list` takes
-`filters`/`sort` (`repositories::filtering::FilterClause`/
-`SortClause`), and `count`/`update_many`/`delete_many` are new —
-`update_many`/`delete_many` inject an `owner_id` equality clause before
-delegating to the repository, the same ownership scoping `update`/
-`delete` already apply (ADR 0007/0011).
+Filter/sort/bulk support that is mechanically derivable from a resource's
+field table (a numeric field always gets `eq`/`min`/`max`/`in`, a string
+field `eq`/`contains`/`icontains`) belongs here or in `repositories::filtering`
+rather than being re-derived per resource. `update_many` and `delete_many`
+add an `owner_id` equality clause before delegating, the same ownership
+scoping `update` and `delete` apply.
 
-`DEFAULT_LIMIT`/`MAX_LIMIT` are the only other resource-agnostic policy
-this module owns (a list request's default/maximum page size);
-everything else is a pass-through to `R`'s methods.
+`DEFAULT_LIMIT` and `MAX_LIMIT` are the only other policy this module owns;
+everything else passes through to the repository.

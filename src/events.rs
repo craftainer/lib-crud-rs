@@ -1,58 +1,53 @@
-//! MQTT-backed CRUD event publish/subscribe -- the transport under
-//! `controllers::crud_events`'s Server-Sent Events stream. See
-//! `docs/adrs/0016-mqtt-backed-sse-crud-event-stream.md` for the design and
-//! `docs/frs/FR-0030-crud-event-stream.md` for the endpoint contract.
+//! CRUD event publish/subscribe: the transport under
+//! [`controllers::crud_events`](crate::controllers::crud_events)'s
+//! Server-Sent Events stream.
 //!
-//! Flat (outside any `src/` submodule) for the same reason `rate_limit.rs`
-//! is: no resource-specific code and no state of its own beyond what it is
-//! handed at construction. `controllers` reaches for it inline the way it
-//! reaches for `RateLimiter` -- deliberately *not* a hook threaded through
-//! `crud::CrudService`, which stays free of infrastructure concerns
-//! (`docs/nfrs/NFR-0004-generic-crud-excludes-resource-logic.md`).
+//! Two buses share one [`EventBus`] type. [`EventBus::mock`] is an in-memory
+//! `tokio::sync::broadcast` fan-out: no broker, no persistence and no replay,
+//! so a host can boot with zero containers. [`EventBus::connect`] (feature
+//! `mqtt`) publishes to and subscribes from an MQTT broker. The bus is not a
+//! hook threaded through [`CrudService`](crate::crud::CrudService), which stays
+//! free of infrastructure: a resource's router calls
+//! [`publish`](crate::controllers::crud_events::publish) itself.
 //!
-//! ## Delivery guarantee (and its exact scope)
+//! ## Delivery guarantee (MQTT bus, and its exact scope)
 //!
-//! A subscriber is issued a `subscriber_id` on first connect. That id --
-//! and nothing else -- is what the guarantee hangs on: it becomes the MQTT
-//! **client id** (`client_id_for`) of a **persistent session**
-//! (`set_clean_session(false)`) subscribed at **QoS 1** to
-//! `crud-events/<resource>`. Because the session is persistent, Mosquitto
-//! queues messages published while that client id is disconnected and
-//! delivers them when the same client id reconnects. That is what makes
-//! "briefly offline, no missed events" true.
+//! A subscriber is issued a `subscriber_id` on first connect. That id, and
+//! nothing else, is what the guarantee hangs on: it becomes the MQTT **client
+//! id** of a **persistent session** (`set_clean_session(false)`) subscribed at
+//! **`QoS` 1** to `crud-events/<resource>`. Because the session is persistent,
+//! the broker queues messages published while that client id is disconnected
+//! and delivers them when the same client id reconnects: "briefly offline, no
+//! missed events".
 //!
-//! It is true *only* for a client that preserves its `subscriber_id` and
-//! sends it back (`?subscriber_id=` or `Last-Event-ID`). A client that
-//! reconnects with no id gets a fresh session and no replay, silently --
-//! by design, since there is no infinite backlog to replay from. The
-//! broker-side queue is bounded by `.devcontainer/stack/mqtt/
-//! mosquitto.conf` (`max_queued_messages 1000`,
-//! `persistent_client_expiration 1h`).
-//!
-//! `Mode::Mock` swaps the broker for a `tokio::sync::broadcast` fan-out
-//! (`EventBus::mock`), the same shape `RateLimiter::mock`/
-//! `HeroMemoryRepository` take so the app still boots with zero containers
-//! (`NFR-0022`). That path is explicitly best-effort: no broker, no
-//! persistent session, no replay. A test run against it cannot be used to
-//! validate the delivery guarantee above -- only `tests/mqtt_events.rs`,
-//! against the real broker, does that.
+//! It holds *only* for a client that keeps its `subscriber_id` and sends it
+//! back (`?subscriber_id=` or `Last-Event-ID`). A client that reconnects with
+//! no id gets a fresh session and no replay, by design: there is no infinite
+//! backlog. The broker-side queue is bounded by the broker's own
+//! configuration (`max_queued_messages`, `persistent_client_expiration`). The
+//! in-memory bus cannot validate the guarantee; only a test against a real
+//! broker (`tests/mqtt_events.rs`) does.
 
+#[cfg(feature = "mqtt")]
 use std::time::Duration;
 
+#[cfg(feature = "mqtt")]
 use rumqttc::{AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS};
 use tokio::sync::broadcast;
 
-/// Abstraction over `rumqttc::EventLoop::poll`, so `EventStream::Mqtt`
+#[cfg(feature = "mqtt")]
+/// Abstraction over `rumqttc::EventLoop::poll`, so an MQTT `EventStream`
 /// can be driven by a test-only fake that returns a scripted sequence of
 /// poll errors -- the only way to deterministically exercise
 /// `next_event`'s backoff/reconnect-limit branches without actually
 /// breaking the shared Mosquitto container mid-suite, which would risk
 /// flaking every other MQTT test running concurrently.
 #[async_trait::async_trait]
-pub trait MqttPoll: Send {
+trait MqttPoll: Send {
     async fn poll(&mut self) -> Result<Event, ConnectionError>;
 }
 
+#[cfg(feature = "mqtt")]
 #[async_trait::async_trait]
 impl MqttPoll for EventLoop {
     async fn poll(&mut self) -> Result<Event, ConnectionError> {
@@ -60,12 +55,13 @@ impl MqttPoll for EventLoop {
     }
 }
 
+#[cfg(feature = "mqtt")]
 /// Keeps the publisher's own MQTT event loop turning so queued publishes
 /// actually leave the process (`EventBus::connect`'s own doc comment) --
 /// runs forever in production; a test drives it against a fake that
 /// answers one scripted error and then pends forever, bounded by a
 /// `tokio::time::timeout`.
-async fn drive_publisher_eventloop(eventloop: &mut dyn MqttPoll) {
+async fn drive_publisher_eventloop<P: MqttPoll>(mut eventloop: P) {
     loop {
         if let Err(err) = eventloop.poll().await {
             tracing::warn!("mqtt publisher connection error: {err}");
@@ -74,8 +70,31 @@ async fn drive_publisher_eventloop(eventloop: &mut dyn MqttPoll) {
     }
 }
 
+/// Queue `value` as a JSON `QoS` 1, non-retained message on `topic`.
+#[cfg(feature = "mqtt")]
+async fn publish_json<T: serde::Serialize + ?Sized>(
+    publisher: &AsyncClient,
+    topic: String,
+    value: &T,
+) -> Result<(), String> {
+    let payload = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+    publisher
+        .publish(topic, QoS::AtLeastOnce, false, payload)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+/// Queue a `QoS` 1 subscription to `topic` on `client`.
+#[cfg(feature = "mqtt")]
+async fn subscribe_to(client: &AsyncClient, topic: String) -> Result<(), EventError> {
+    client
+        .subscribe(topic, QoS::AtLeastOnce)
+        .await
+        .map_err(|err| EventError::Broker(err.to_string()))
+}
+
 /// Root of the topic tree every resource's events publish under, matching
-/// the reference implementation's `crud-events/<resource>`.
+/// `crud-events/<resource>`.
 const TOPIC_ROOT: &str = "crud-events";
 
 /// Bound on a client-supplied `subscriber_id`. The id is interpolated into
@@ -84,7 +103,7 @@ const TOPIC_ROOT: &str = "crud-events";
 /// their own length limits and a `/`-bearing id would be confusing at best.
 const MAX_SUBSCRIBER_ID_LEN: usize = 64;
 
-/// Fan-out queue depth for the `Mode::Mock` broadcast channel, and the
+/// Fan-out queue depth for the the in-memory bus broadcast channel, and the
 /// per-connection request-channel capacity for the real `AsyncClient`.
 const CHANNEL_CAPACITY: usize = 64;
 
@@ -93,33 +112,40 @@ const CHANNEL_CAPACITY: usize = 64;
 /// reconnect from scratch. Without a cap, an unreachable broker would spin
 /// the poll loop; without any tolerance, a single blip would drop every
 /// open stream.
+#[cfg(feature = "mqtt")]
 const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
-#[cfg(not(test))]
+#[cfg(all(feature = "mqtt", not(test)))]
 const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 // A few milliseconds under test, so the backoff/reconnect-limit tests
 // below don't spend real seconds sleeping -- same idea as
 // `crud_events.rs`'s `KEEP_ALIVE_INTERVAL` cfg override.
-#[cfg(test)]
+#[cfg(all(feature = "mqtt", test))]
 const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(1);
 
+#[cfg(feature = "mqtt")]
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 
-/// What happened to a record. Broader than a revision log's scope (the
-/// reference ADR's `RevisionSink` comparison): a subscriber watching a
-/// resource in real time cares about bulk actions as their own kind, not
-/// as N single-record events.
+/// What happened to a record. Broader than a revision log's scope: a
+/// subscriber watching a resource in real time cares about bulk actions as
+/// their own kind, not as N single-record events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventAction {
+    /// A record was created.
     Create,
+    /// A record was updated.
     Update,
+    /// A bulk update touched several records.
     UpdateMany,
+    /// A record was deleted.
     Delete,
+    /// A bulk delete touched several records.
     DeleteMany,
 }
 
 impl EventAction {
     /// The SSE `event:` name for this action.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             EventAction::Create => "create",
@@ -135,17 +161,21 @@ impl EventAction {
 /// the way out, of an SSE frame's `data:`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CrudEvent {
-    /// The resource segment of the topic (`heroes`), so a client
+    /// The resource segment of the topic (`widgets`), so a client
     /// multiplexing several streams can tell them apart.
     pub resource: String,
+    /// What happened.
     pub action: EventAction,
     /// Every record the action touched -- one id for the single-record
     /// actions, zero or more for the bulk ones.
     pub ids: Vec<i32>,
+    /// When it happened (UTC).
     pub occurred_at: chrono::NaiveDateTime,
 }
 
 impl CrudEvent {
+    /// An event for `resource`, stamped with the current time.
+    #[must_use]
     pub fn new(resource: &str, action: EventAction, ids: Vec<i32>) -> Self {
         Self {
             resource: resource.to_string(),
@@ -157,12 +187,15 @@ impl CrudEvent {
 }
 
 /// The MQTT topic one resource's events publish to and are subscribed from.
+#[must_use]
 pub fn topic(resource: &str) -> String {
     format!("{TOPIC_ROOT}/{resource}")
 }
 
-/// The MQTT client id a `subscriber_id` maps to. Stable for the life of
+#[cfg(feature = "mqtt")]
+/// The `MQTT` client id a `subscriber_id` maps to. Stable for the life of
 /// the subscriber id -- that stability *is* the persistent session.
+#[must_use]
 pub fn client_id_for(subscriber_id: &str) -> String {
     format!("crud-events-{subscriber_id}")
 }
@@ -172,6 +205,7 @@ pub fn client_id_for(subscriber_id: &str) -> String {
 /// client id), within `MAX_SUBSCRIBER_ID_LEN`, and restricted to
 /// ASCII alphanumerics plus `-`/`_`. Anything else is rejected rather than
 /// escaped, and the caller issues a fresh id instead.
+#[must_use]
 pub fn sanitize_subscriber_id(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.len() > MAX_SUBSCRIBER_ID_LEN {
@@ -195,28 +229,32 @@ const SUBSCRIBER_ID_BYTES: usize = 16;
 /// capability -- whoever presents it resumes that persistent session and
 /// its queued events.
 ///
-/// Panics only if the OS entropy source itself is unavailable, which is
+/// # Panics
+///
+/// Only if the OS entropy source itself is unavailable, which is
 /// unrecoverable and exactly what `uuid::Uuid::new_v4`/`rand`'s `OsRng`
 /// do in the same situation.
+#[must_use]
 pub fn new_subscriber_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut bytes = [0u8; SUBSCRIBER_ID_BYTES];
     getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Logs a CRUD event's serialization failure and drops the publish --
-/// see `EventBus::publish`'s own doc comment for why this never
-/// propagates to the caller. `CrudEvent` is owned scalars, so this branch
-/// never actually fires in practice; it's still tested directly rather
-/// than left unreachable.
-fn log_and_skip_publish(err: serde_json::Error) {
-    tracing::error!("failed to serialize CRUD event: {err}");
+    bytes
+        .iter()
+        .flat_map(|&byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect()
 }
 
 /// Something went wrong opening a subscriber's stream.
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
     #[error("event broker error: {0}")]
+    /// The broker rejected or dropped the subscription.
     Broker(String),
 }
 
@@ -225,6 +263,7 @@ enum Backend {
     /// subscriber opens its *own* persistent session against (each
     /// subscriber needs a distinct client id, so they cannot share one
     /// connection).
+    #[cfg(feature = "mqtt")]
     Mqtt {
         host: String,
         port: u16,
@@ -233,8 +272,8 @@ enum Backend {
     Mock(broadcast::Sender<CrudEvent>),
 }
 
-/// Shared event bus -- one instance built at startup (`lib.rs`'s
-/// `build_event_bus`), held in `AppState` behind an `Arc`.
+/// Shared event bus: build one at startup and share it (for example behind an
+/// `Arc` in the application state).
 pub struct EventBus {
     backend: Backend,
 }
@@ -249,18 +288,20 @@ impl EventBus {
     /// process-scoped client id -- only subscribers need persistence, and a
     /// persistent publisher session would accumulate broker state for a
     /// client that never subscribes to anything.
+    #[cfg(feature = "mqtt")]
+    #[must_use]
     pub fn connect(host: &str, port: u16) -> Self {
         let client_id = format!("crud-events-publisher-{}", new_subscriber_id());
         let mut options = MqttOptions::new(client_id, host, port);
         options.set_keep_alive(KEEP_ALIVE);
         options.set_clean_session(true);
-        let (publisher, mut eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        let (publisher, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
 
         // The event loop is what actually drives the socket; a publish only
         // leaves the process while something polls it. Nothing consumes
         // incoming packets on the publisher connection, so this task just
         // keeps it turning and logs failures.
-        tokio::spawn(async move { drive_publisher_eventloop(&mut eventloop).await });
+        tokio::spawn(drive_publisher_eventloop(eventloop));
 
         Self {
             backend: Backend::Mqtt {
@@ -271,8 +312,9 @@ impl EventBus {
         }
     }
 
-    /// The `Mode::Mock` in-memory fan-out -- see the module doc for what it
+    /// The the in-memory bus in-memory fan-out -- see the module doc for what it
     /// deliberately does not provide.
+    #[must_use]
     pub fn mock() -> Self {
         let (sender, _) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
@@ -280,21 +322,23 @@ impl EventBus {
         }
     }
 
-    /// Publish one event at QoS 1, non-retained. Failures are logged, never
+    /// Publish one event at `QoS` 1, non-retained. Failures are logged, never
     /// propagated: a CRUD write that already succeeded must not be reported
     /// to the caller as failed because a side-channel notification could
     /// not be delivered.
+    #[cfg_attr(
+        not(feature = "mqtt"),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the signature is the same with and without the `mqtt` feature"
+        )
+    )]
     pub async fn publish(&self, event: CrudEvent) {
         match &self.backend {
+            #[cfg(feature = "mqtt")]
             Backend::Mqtt { publisher, .. } => {
-                let payload = match serde_json::to_vec(&event) {
-                    Ok(payload) => payload,
-                    Err(err) => return log_and_skip_publish(err),
-                };
-                if let Err(err) = publisher
-                    .publish(topic(&event.resource), QoS::AtLeastOnce, false, payload)
-                    .await
-                {
+                if let Err(err) = publish_json(publisher, topic(&event.resource), &event).await {
                     tracing::warn!("failed to publish CRUD event: {err}");
                 }
             }
@@ -309,15 +353,28 @@ impl EventBus {
     /// Open `subscriber_id`'s stream of `resource` events.
     ///
     /// On the MQTT path this opens (or *resumes*) that subscriber's own
-    /// persistent session and subscribes at QoS 1 -- everything the broker
+    /// persistent session and subscribes at `QoS` 1 -- everything the broker
     /// queued for the same client id while it was away is delivered before
     /// anything new.
+    ///
+    /// # Errors
+    ///
+    /// [`EventError::Broker`] when the broker refuses the subscription.
+    #[cfg_attr(
+        not(feature = "mqtt"),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the signature is the same with and without the `mqtt` feature"
+        )
+    )]
     pub async fn subscribe(
         &self,
         resource: &str,
         subscriber_id: &str,
     ) -> Result<EventStream, EventError> {
         match &self.backend {
+            #[cfg(feature = "mqtt")]
             Backend::Mqtt { host, port, .. } => {
                 let mut options = MqttOptions::new(client_id_for(subscriber_id), host, *port);
                 options.set_keep_alive(KEEP_ALIVE);
@@ -328,22 +385,25 @@ impl EventBus {
                 // panics on an empty client id) safe.
                 options.set_clean_session(false);
                 let (client, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
-                client
-                    .subscribe(topic(resource), QoS::AtLeastOnce)
-                    .await
-                    .map_err(|err| EventError::Broker(err.to_string()))?;
-                Ok(EventStream::Mqtt {
-                    // Kept alive alongside the event loop: dropping the
-                    // client closes the request channel and ends the loop.
-                    _client: client,
-                    eventloop: Box::new(eventloop),
-                    consecutive_errors: 0,
+                let subscribed = subscribe_to(&client, topic(resource)).await;
+                subscribed.map(|()| {
+                    EventStream(Inner::Mqtt {
+                        // Kept alive alongside the event loop: dropping the
+                        // client closes the request channel and ends the loop.
+                        _client: client,
+                        eventloop: Box::new(eventloop),
+                        consecutive_errors: 0,
+                    })
                 })
             }
-            Backend::Mock(sender) => Ok(EventStream::Mock {
-                receiver: sender.subscribe(),
-                resource: resource.to_string(),
-            }),
+            Backend::Mock(sender) => {
+                // The in-memory bus has no per-subscriber session to key.
+                let _ = subscriber_id;
+                Ok(EventStream(Inner::Mock {
+                    receiver: sender.subscribe(),
+                    resource: resource.to_string(),
+                }))
+            }
         }
     }
 }
@@ -351,7 +411,10 @@ impl EventBus {
 /// One subscriber's live event feed. Dropping it disconnects that
 /// subscriber's MQTT session -- which the broker keeps (and queues into)
 /// because the session is persistent.
-pub enum EventStream {
+pub struct EventStream(Inner);
+
+enum Inner {
+    #[cfg(feature = "mqtt")]
     Mqtt {
         _client: AsyncClient,
         eventloop: Box<dyn MqttPoll>,
@@ -366,12 +429,13 @@ pub enum EventStream {
 impl EventStream {
     /// The next event, or `None` once the feed is finished (the broker went
     /// away for `MAX_CONSECUTIVE_POLL_ERRORS` consecutive attempts, or --
-    /// under `Mode::Mock` -- the bus itself was dropped). Ending the stream
+    /// under the in-memory bus -- the bus itself was dropped). Ending the stream
     /// is safe: the client reconnects with the same `subscriber_id` and
     /// resumes the same persistent session.
     pub async fn next_event(&mut self) -> Option<CrudEvent> {
-        match self {
-            EventStream::Mqtt {
+        match &mut self.0 {
+            #[cfg(feature = "mqtt")]
+            Inner::Mqtt {
                 eventloop,
                 consecutive_errors,
                 ..
@@ -406,14 +470,14 @@ impl EventStream {
                     }
                 }
             },
-            EventStream::Mock {
+            Inner::Mock {
                 receiver, resource, ..
             } => loop {
                 match receiver.recv().await {
                     // One broadcast channel carries every resource, unlike
                     // MQTT's per-resource topic, so filter here.
                     Ok(event) if event.resource == *resource => return Some(event),
-                    Ok(_) => continue,
+                    Ok(_) => {}
                     // Lagged: this subscriber fell behind the fan-out
                     // buffer. Best-effort by design under Mode::Mock (see
                     // the module doc) -- keep going from wherever the
@@ -434,9 +498,10 @@ mod tests {
 
     #[test]
     fn topic_is_namespaced_under_the_crud_events_root() {
-        assert_eq!(topic("heroes"), "crud-events/heroes");
+        assert_eq!(topic("widgets"), "crud-events/widgets");
     }
 
+    #[cfg(feature = "mqtt")]
     #[test]
     fn client_id_is_derived_from_the_subscriber_id() {
         assert_eq!(client_id_for("abc123"), "crud-events-abc123");
@@ -445,19 +510,13 @@ mod tests {
     #[test]
     fn a_new_subscriber_id_is_a_valid_subscriber_id() {
         let id = new_subscriber_id();
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         assert_eq!(sanitize_subscriber_id(&id).as_deref(), Some(id.as_str()));
     }
 
     #[test]
     fn new_subscriber_ids_are_unique() {
         assert_ne!(new_subscriber_id(), new_subscriber_id());
-    }
-
-    #[test]
-    fn log_and_skip_publish_does_not_panic() {
-        let err = serde_json::from_str::<i32>("bad").unwrap_err();
-        log_and_skip_publish(err);
     }
 
     #[test]
@@ -510,19 +569,19 @@ mod tests {
 
     #[test]
     fn a_crud_event_round_trips_through_json() {
-        let event = CrudEvent::new("heroes", EventAction::DeleteMany, vec![1, 2, 3]);
+        let event = CrudEvent::new("widgets", EventAction::DeleteMany, vec![1, 2, 3]);
         let encoded = serde_json::to_vec(&event).unwrap();
         let decoded: CrudEvent = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, event);
-        assert_eq!(decoded.resource, "heroes");
+        assert_eq!(decoded.resource, "widgets");
         assert_eq!(decoded.ids, vec![1, 2, 3]);
     }
 
     #[tokio::test]
     async fn mock_bus_fans_an_event_out_to_a_subscriber() {
         let bus = EventBus::mock();
-        let mut stream = bus.subscribe("heroes", "sub-1").await.unwrap();
-        bus.publish(CrudEvent::new("heroes", EventAction::Create, vec![7]))
+        let mut stream = bus.subscribe("widgets", "sub-1").await.unwrap();
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![7]))
             .await;
         let event = stream.next_event().await.unwrap();
         assert_eq!(event.action, EventAction::Create);
@@ -532,9 +591,9 @@ mod tests {
     #[tokio::test]
     async fn mock_bus_delivers_to_every_open_subscriber() {
         let bus = EventBus::mock();
-        let mut a = bus.subscribe("heroes", "sub-a").await.unwrap();
-        let mut b = bus.subscribe("heroes", "sub-b").await.unwrap();
-        bus.publish(CrudEvent::new("heroes", EventAction::Update, vec![1]))
+        let mut a = bus.subscribe("widgets", "sub-a").await.unwrap();
+        let mut b = bus.subscribe("widgets", "sub-b").await.unwrap();
+        bus.publish(CrudEvent::new("widgets", EventAction::Update, vec![1]))
             .await;
         assert_eq!(a.next_event().await.unwrap().ids, vec![1]);
         assert_eq!(b.next_event().await.unwrap().ids, vec![1]);
@@ -543,27 +602,27 @@ mod tests {
     #[tokio::test]
     async fn mock_bus_filters_events_for_other_resources() {
         let bus = EventBus::mock();
-        let mut stream = bus.subscribe("heroes", "sub-1").await.unwrap();
-        bus.publish(CrudEvent::new("villains", EventAction::Create, vec![1]))
+        let mut stream = bus.subscribe("widgets", "sub-1").await.unwrap();
+        bus.publish(CrudEvent::new("gadgets", EventAction::Create, vec![1]))
             .await;
-        bus.publish(CrudEvent::new("heroes", EventAction::Create, vec![2]))
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![2]))
             .await;
         let event = stream.next_event().await.unwrap();
-        assert_eq!(event.resource, "heroes");
+        assert_eq!(event.resource, "widgets");
         assert_eq!(event.ids, vec![2]);
     }
 
     #[tokio::test]
     async fn mock_bus_publish_with_no_subscribers_is_a_no_op() {
         let bus = EventBus::mock();
-        bus.publish(CrudEvent::new("heroes", EventAction::Create, vec![1]))
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
             .await;
     }
 
     #[tokio::test]
     async fn a_mock_stream_ends_once_the_bus_is_dropped() {
         let bus = EventBus::mock();
-        let mut stream = bus.subscribe("heroes", "sub-1").await.unwrap();
+        let mut stream = bus.subscribe("widgets", "sub-1").await.unwrap();
         drop(bus);
         assert!(stream.next_event().await.is_none());
     }
@@ -571,11 +630,11 @@ mod tests {
     #[tokio::test]
     async fn a_lagging_mock_subscriber_keeps_going_after_dropping_events() {
         let bus = EventBus::mock();
-        let mut stream = bus.subscribe("heroes", "sub-1").await.unwrap();
+        let mut stream = bus.subscribe("widgets", "sub-1").await.unwrap();
         // Overrun the fan-out buffer without reading, then confirm the
         // stream resumes rather than ending.
-        for id in 0..(CHANNEL_CAPACITY as i32 + 5) {
-            bus.publish(CrudEvent::new("heroes", EventAction::Create, vec![id]))
+        for id in 0..(i32::try_from(CHANNEL_CAPACITY).unwrap() + 5) {
+            bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![id]))
                 .await;
         }
         let event = stream.next_event().await.unwrap();
@@ -586,10 +645,12 @@ mod tests {
     /// deterministic way to drive `EventStream::next_event`'s MQTT
     /// backoff/reconnect-limit branches, which only run against a broken
     /// broker connection (see `MqttPoll`'s own doc comment).
+    #[cfg(feature = "mqtt")]
     struct ScriptedEventLoop {
         responses: std::collections::VecDeque<Result<Event, ConnectionError>>,
     }
 
+    #[cfg(feature = "mqtt")]
     impl ScriptedEventLoop {
         fn new(responses: Vec<Result<Event, ConnectionError>>) -> Self {
             Self {
@@ -598,6 +659,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mqtt")]
     #[async_trait::async_trait]
     impl MqttPoll for ScriptedEventLoop {
         async fn poll(&mut self) -> Result<Event, ConnectionError> {
@@ -607,16 +669,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mqtt")]
     fn mqtt_stream_with(responses: Vec<Result<Event, ConnectionError>>) -> EventStream {
         let options = MqttOptions::new("test-client", "localhost", 1883);
         let (client, _real_eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
-        EventStream::Mqtt {
+        EventStream(Inner::Mqtt {
             _client: client,
             eventloop: Box::new(ScriptedEventLoop::new(responses)),
             consecutive_errors: 0,
-        }
+        })
     }
 
+    #[cfg(feature = "mqtt")]
     fn publish_event(event: &CrudEvent) -> Event {
         Event::Incoming(Packet::Publish(rumqttc::Publish::new(
             topic(&event.resource),
@@ -625,9 +689,10 @@ mod tests {
         )))
     }
 
+    #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn mqtt_stream_backs_off_and_recovers_from_fewer_than_max_consecutive_errors() {
-        let event = CrudEvent::new("heroes", EventAction::Create, vec![9]);
+        let event = CrudEvent::new("widgets", EventAction::Create, vec![9]);
         let mut stream = mqtt_stream_with(vec![
             Err(ConnectionError::NetworkTimeout),
             Err(ConnectionError::NetworkTimeout),
@@ -637,6 +702,24 @@ mod tests {
         assert_eq!(received.ids, vec![9]);
     }
 
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn mqtt_stream_skips_an_undecodable_payload_and_protocol_acks() {
+        let event = CrudEvent::new("widgets", EventAction::Create, vec![3]);
+        let garbage = Event::Incoming(Packet::Publish(rumqttc::Publish::new(
+            topic("widgets"),
+            QoS::AtLeastOnce,
+            b"not json".to_vec(),
+        )));
+        let mut stream = mqtt_stream_with(vec![
+            Ok(Event::Incoming(Packet::PingResp)),
+            Ok(garbage),
+            Ok(publish_event(&event)),
+        ]);
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![3]);
+    }
+
+    #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn mqtt_stream_ends_after_max_consecutive_poll_errors() {
         let mut responses = Vec::with_capacity(MAX_CONSECUTIVE_POLL_ERRORS as usize);
@@ -647,30 +730,130 @@ mod tests {
         assert!(stream.next_event().await.is_none());
     }
 
-    /// One scripted error, then pends forever -- for
+    /// A scripted error and a healthy poll, then pends forever -- for
     /// `drive_publisher_eventloop`'s infinite loop, which a test can only
     /// ever observe a bounded prefix of.
-    struct FirstErrorThenPendingForever(Option<ConnectionError>);
+    #[cfg(feature = "mqtt")]
+    struct FirstErrorThenPendingForever(std::collections::VecDeque<Result<Event, ConnectionError>>);
 
+    #[cfg(feature = "mqtt")]
     #[async_trait::async_trait]
     impl MqttPoll for FirstErrorThenPendingForever {
         async fn poll(&mut self) -> Result<Event, ConnectionError> {
-            match self.0.take() {
-                Some(err) => Err(err),
+            match self.0.pop_front() {
+                Some(result) => result,
                 None => std::future::pending().await,
             }
         }
     }
 
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_publish_the_client_cannot_queue_is_logged_not_propagated() {
+        // Dropping the event loop closes the client's request channel, so
+        // every publish fails to queue.
+        let options = MqttOptions::new("test-publisher", "localhost", 1883);
+        let (publisher, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        drop(eventloop);
+        let bus = EventBus {
+            backend: Backend::Mqtt {
+                host: "localhost".to_string(),
+                port: 1883,
+                publisher,
+            },
+        };
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
+            .await;
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_publish_the_client_can_queue_succeeds_without_a_broker() {
+        // The event loop is kept (and never polled), so the request channel
+        // stays open and the publish queues.
+        let options = MqttOptions::new("test-publisher", "localhost", 1);
+        let (publisher, _eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        let bus = EventBus {
+            backend: Backend::Mqtt {
+                host: "localhost".to_string(),
+                port: 1,
+                publisher,
+            },
+        };
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
+            .await;
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn subscribing_on_the_mqtt_bus_queues_the_subscription_without_a_broker() {
+        // Nothing connects until the stream is polled, so an unreachable
+        // broker address is fine for opening the subscription.
+        let options = MqttOptions::new("test-publisher", "localhost", 1);
+        let (publisher, _eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        let bus = EventBus {
+            backend: Backend::Mqtt {
+                host: "localhost".to_string(),
+                port: 1,
+                publisher,
+            },
+        };
+        assert!(bus.subscribe("widgets", "sub-1").await.is_ok());
+    }
+
+    #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn drive_publisher_eventloop_logs_and_backs_off_on_a_poll_error() {
-        let mut eventloop = FirstErrorThenPendingForever(Some(ConnectionError::NetworkTimeout));
+        let eventloop = FirstErrorThenPendingForever(
+            [
+                Err(ConnectionError::NetworkTimeout),
+                Ok(Event::Incoming(Packet::PingResp)),
+            ]
+            .into(),
+        );
         // The loop never returns on its own; give it just long enough to
-        // take the error branch once before cutting it off.
+        // take the error branch and then a healthy poll before cutting it off.
         let _ = tokio::time::timeout(
             Duration::from_millis(50),
-            drive_publisher_eventloop(&mut eventloop),
+            drive_publisher_eventloop(eventloop),
         )
         .await;
+    }
+
+    /// A value whose JSON encoding always fails.
+    #[cfg(feature = "mqtt")]
+    struct Unencodable;
+
+    #[cfg(feature = "mqtt")]
+    impl serde::Serialize for Unencodable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("cannot encode"))
+        }
+    }
+
+    #[cfg(feature = "mqtt")]
+    fn client_with_closed_request_channel() -> AsyncClient {
+        let options = MqttOptions::new("test-closed", "localhost", 1883);
+        let (client, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        drop(eventloop);
+        client
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn publish_json_reports_an_encoding_failure() {
+        let client = client_with_closed_request_channel();
+        let err = publish_json(&client, "t".to_string(), &Unencodable)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot encode"), "{err}");
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn subscribe_to_reports_a_closed_request_channel_as_a_broker_error() {
+        let client = client_with_closed_request_channel();
+        let err = subscribe_to(&client, "t".to_string()).await.unwrap_err();
+        assert!(matches!(err, EventError::Broker(_)));
     }
 }

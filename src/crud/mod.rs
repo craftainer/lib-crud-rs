@@ -1,22 +1,18 @@
-//! The generic CRUD interface: a thin, fully generic service built from a
-//! `repositories::Repository`. Port of `interfaces/base.py`'s
-//! `CRUDInterface` -- see `docs/adrs/0001` for why this abstraction is
-//! deliberately chosen over "three similar lines is better than a
-//! premature abstraction" (this repo's own equivalent of that CLAUDE.md
-//! rule): a template's job is to make the *next* resource cheap, not just
-//! to demonstrate one. `CrudService<R>` has zero Hero-specific code -- it
-//! only knows the generic parameters `M`/`C`/`U` its `Repository` impl
-//! carries (`docs/nfrs/0004-generic-crud-excludes-resource-logic.md`).
+//! The generic CRUD service: a thin, fully generic wrapper over a
+//! [`Repository`]. It has no resource-specific code: it only knows the
+//! `Model`/`Create`/`Update` types its repository carries. Policy it owns is
+//! the page-size limits ([`DEFAULT_LIMIT`], [`MAX_LIMIT`]) and the owner
+//! scoping of bulk actions; everything else is a pass-through.
 
-use crate::generic::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
-use crate::generic::repositories::{ListOptions, RepoError, Repository};
+use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
+use crate::repositories::{ListOptions, RepoError, Repository};
 
 /// The default `?limit=` when a caller supplies none.
 pub const DEFAULT_LIMIT: u64 = 100;
-/// The maximum `?limit=` a caller may request -- mirrors `crud_router.py`'s
-/// `_MAX_LIMIT`.
+/// The maximum `?limit=` a caller may request.
 pub const MAX_LIMIT: u64 = 1000;
 
+/// A resource-agnostic service over any [`Repository`].
 pub struct CrudService<R> {
     repository: R,
 }
@@ -25,10 +21,16 @@ impl<R> CrudService<R>
 where
     R: Repository,
 {
+    /// Wrap `repository`.
     pub fn new(repository: R) -> Self {
         Self { repository }
     }
 
+    /// One page of records. `limit` is clamped to `1..=`[`MAX_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn list(
         &self,
         skip: u64,
@@ -50,9 +52,12 @@ where
     }
 
     /// How many non-archived (unless `include_archived`) records match
-    /// `filters` -- callers use this to cap a bulk update/delete before it
-    /// runs (`docs/adrs/0013`), matching `_check_bulk_action_size` in the
-    /// reference.
+    /// `filters`; callers use this to cap a bulk update/delete before it
+    /// runs.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn count(
         &self,
         filters: &[FilterClause],
@@ -61,6 +66,11 @@ where
         self.repository.count(filters, include_archived).await
     }
 
+    /// The record `id`, or `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn get(
         &self,
         id: i32,
@@ -69,10 +79,20 @@ where
         self.repository.get(id, include_archived).await
     }
 
+    /// Create a record owned by `owner_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn create(&self, owner_id: &str, data: R::Create) -> Result<R::Model, RepoError> {
         self.repository.create(owner_id, data).await
     }
 
+    /// Update record `id`, scoped to `owner_id`; `None` when no row matched.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn update(
         &self,
         id: i32,
@@ -84,9 +104,13 @@ where
 
     /// Apply `data` to every non-archived record matching `filters`,
     /// scoped to `owner_id` -- mirrors `update`'s ownership scoping
-    /// (ADR 0007/0011) by adding an `owner_id` equality clause before
+    /// by adding an `owner_id` equality clause before
     /// delegating, rather than trusting the caller-supplied filters to
     /// include one.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn update_many(
         &self,
         owner_id: &str,
@@ -98,12 +122,21 @@ where
             .await
     }
 
+    /// Soft-delete record `id`, scoped to `owner_id`; `false` when no row matched.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn delete(&self, id: i32, owner_id: &str) -> Result<bool, RepoError> {
         self.repository.delete(id, owner_id).await
     }
 
     /// Soft-delete every non-archived record matching `filters`, scoped to
     /// `owner_id` -- same ownership reasoning as `update_many` above.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] when the backend fails.
     pub async fn delete_many(
         &self,
         owner_id: &str,
@@ -131,16 +164,16 @@ mod tests {
     use std::sync::Mutex;
 
     /// A minimal `Repository` fake, independent of any real resource --
-    /// `CrudService<R>` has zero resource-specific code (NFR-0004), so its
+    /// `CrudService<R>` has zero resource-specific code , so its
     /// own tests shouldn't need a real one either. Records the last
     /// `ListOptions` it was called with so `list()`'s limit-clamping can be
     /// asserted directly.
     #[derive(Default)]
     struct FakeRepository {
-        last_list_opts: Mutex<Option<ListOptions>>,
-        last_count_filters: Mutex<Option<Vec<FilterClause>>>,
-        last_update_many_filters: Mutex<Option<Vec<FilterClause>>>,
-        last_delete_many_filters: Mutex<Option<Vec<FilterClause>>>,
+        list_opts: Mutex<Option<ListOptions>>,
+        count_filters: Mutex<Option<Vec<FilterClause>>>,
+        update_many_filters: Mutex<Option<Vec<FilterClause>>>,
+        delete_many_filters: Mutex<Option<Vec<FilterClause>>>,
     }
 
     #[async_trait]
@@ -150,7 +183,7 @@ mod tests {
         type Update = i32;
 
         async fn list(&self, opts: ListOptions) -> Result<Vec<i32>, RepoError> {
-            *self.last_list_opts.lock().unwrap() = Some(opts);
+            *self.list_opts.lock().unwrap() = Some(opts);
             Ok(vec![])
         }
 
@@ -159,7 +192,7 @@ mod tests {
             filters: &[FilterClause],
             _include_archived: bool,
         ) -> Result<u64, RepoError> {
-            *self.last_count_filters.lock().unwrap() = Some(filters.to_vec());
+            *self.count_filters.lock().unwrap() = Some(filters.to_vec());
             Ok(filters.len() as u64)
         }
 
@@ -185,7 +218,7 @@ mod tests {
             filters: &[FilterClause],
             data: i32,
         ) -> Result<Vec<i32>, RepoError> {
-            *self.last_update_many_filters.lock().unwrap() = Some(filters.to_vec());
+            *self.update_many_filters.lock().unwrap() = Some(filters.to_vec());
             Ok(vec![data])
         }
 
@@ -194,7 +227,7 @@ mod tests {
         }
 
         async fn delete_many(&self, filters: &[FilterClause]) -> Result<Vec<i32>, RepoError> {
-            *self.last_delete_many_filters.lock().unwrap() = Some(filters.to_vec());
+            *self.delete_many_filters.lock().unwrap() = Some(filters.to_vec());
             Ok(vec![1])
         }
     }
@@ -205,7 +238,7 @@ mod tests {
         service.list(0, 0, false, vec![], vec![]).await.unwrap();
         let opts = service
             .repository
-            .last_list_opts
+            .list_opts
             .lock()
             .unwrap()
             .clone()
@@ -222,7 +255,7 @@ mod tests {
             .unwrap();
         let opts = service
             .repository
-            .last_list_opts
+            .list_opts
             .lock()
             .unwrap()
             .clone()
@@ -236,7 +269,7 @@ mod tests {
         service.list(5, 50, true, vec![], vec![]).await.unwrap();
         let opts = service
             .repository
-            .last_list_opts
+            .list_opts
             .lock()
             .unwrap()
             .clone()
@@ -264,7 +297,7 @@ mod tests {
             .unwrap();
         let opts = service
             .repository
-            .last_list_opts
+            .list_opts
             .lock()
             .unwrap()
             .clone()
@@ -299,7 +332,7 @@ mod tests {
         service.update_many("alice", vec![], 7).await.unwrap();
         let filters = service
             .repository
-            .last_update_many_filters
+            .update_many_filters
             .lock()
             .unwrap()
             .clone()
@@ -316,7 +349,7 @@ mod tests {
         service.delete_many("bob", vec![]).await.unwrap();
         let filters = service
             .repository
-            .last_delete_many_filters
+            .delete_many_filters
             .lock()
             .unwrap()
             .clone()

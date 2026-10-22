@@ -1,15 +1,14 @@
-//! The resource-agnostic half of `GET <prefix>/events` -- subscriber-id
-//! resolution, the SSE frame shape, and the publish helper every mutating
-//! handler calls. `controllers::heroes` supplies the one resource-specific
-//! thing this needs: the resource name (`"heroes"`).
+//! The resource-agnostic half of a `GET <prefix>/events` route:
+//! subscriber-id resolution, the SSE frame shape and the publish helper
+//! every mutating handler calls. A resource's router supplies the one
+//! resource-specific thing this needs, the resource name.
 //!
-//! Shaped like `crud_actions`/`crud_query`: free functions a resource's
-//! router composes, not a router of its own -- so a second resource gets
-//! the same endpoint by adding one route and one `&'static str`.
+//! Shaped like [`crud_actions`](super::crud_actions): free functions a
+//! resource's router composes, not a router of its own, so a second resource
+//! gets the same endpoint by adding one route and one `&'static str`.
 //!
-//! See `src/events.rs` for the transport and the delivery guarantee's exact
-//! scope, `docs/adrs/0016-mqtt-backed-sse-crud-event-stream.md` for why
-//! MQTT, and `docs/frs/FR-0030-crud-event-stream.md` for the contract.
+//! See [`crate::events`] for the transport and the delivery guarantee's
+//! exact scope.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -20,13 +19,14 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 
+use crate::error::CrudError;
 use crate::events::{
-    new_subscriber_id, sanitize_subscriber_id, CrudEvent, EventAction, EventBus, EventStream,
+    CrudEvent, EventAction, EventBus, EventError, EventStream, new_subscriber_id,
+    sanitize_subscriber_id,
 };
-use crate::problem_details::AppError;
 
 /// The header a browser's `EventSource` resends automatically after a
-/// dropped connection -- this app puts the `subscriber_id` in every frame's
+/// dropped connection -- the stream puts the `subscriber_id` in every frame's
 /// `id:` field precisely so that automatic resend is enough to resume the
 /// persistent session, with no client-side bookkeeping.
 const LAST_EVENT_ID: &str = "last-event-id";
@@ -85,13 +85,10 @@ fn event_frame(subscriber_id: &str, event: &CrudEvent) -> SseEvent {
     let frame = SseEvent::default()
         .event(event.action.as_str())
         .id(subscriber_id);
-    match frame.json_data(event) {
-        Ok(frame) => frame,
-        // CrudEvent is a plain struct of owned scalars, so this is
-        // unreachable in practice; degrade to a typed error frame rather
-        // than panicking inside a live connection.
-        Err(err) => error_frame(err),
-    }
+    // CrudEvent is a plain struct of owned scalars, so encoding never fails
+    // in practice; degrade to a typed error frame rather than panicking
+    // inside a live connection.
+    frame.json_data(event).unwrap_or_else(error_frame)
 }
 
 /// Logs an SSE frame's JSON-encode failure and returns a typed error
@@ -106,17 +103,28 @@ fn error_frame(err: impl std::fmt::Display) -> SseEvent {
 }
 
 /// Build the SSE response for `resource`'s event stream.
+///
+/// # Errors
+///
+/// [`CrudError::ServiceUnavailable`] when the bus cannot open the
+/// subscription (for example the broker is down).
 pub async fn event_stream(
     bus: &EventBus,
     resource: &'static str,
     requested_subscriber_id: Option<&str>,
     headers: &HeaderMap,
-) -> Result<EventSse, AppError> {
+) -> Result<EventSse, CrudError> {
     let subscriber_id = resolve_subscriber_id(requested_subscriber_id, headers);
-    let stream = bus
-        .subscribe(resource, &subscriber_id)
-        .await
-        .map_err(|err| AppError::ServiceUnavailable(err.to_string()))?;
+    let stream = bus.subscribe(resource, &subscriber_id).await;
+    into_sse(subscriber_id, stream)
+}
+
+/// The response for a resolved subscription, or the 503 for a failed one.
+fn into_sse(
+    subscriber_id: String,
+    stream: Result<EventStream, EventError>,
+) -> Result<EventSse, CrudError> {
+    let stream = stream.map_err(|err| CrudError::ServiceUnavailable(err.to_string()))?;
     Ok(sse_from(subscriber_id, stream))
 }
 
@@ -157,6 +165,16 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(LAST_EVENT_ID, HeaderValue::from_str(value).unwrap());
         headers
+    }
+
+    #[test]
+    fn a_failed_subscription_becomes_a_503() {
+        let err = into_sse(
+            "sub".to_string(),
+            Err(EventError::Broker("broker down".to_string())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CrudError::ServiceUnavailable(msg) if msg.contains("broker down")));
     }
 
     #[test]
@@ -214,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_frame_carries_the_subscriber_id() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "heroes", Some("sub-1"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", Some("sub-1"), &HeaderMap::new())
             .await
             .unwrap();
         let body = first_frames(response, 1).await;
@@ -226,10 +244,10 @@ mod tests {
     #[tokio::test]
     async fn published_events_become_frames_named_after_the_action() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "heroes", Some("sub-2"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", Some("sub-2"), &HeaderMap::new())
             .await
             .unwrap();
-        publish(&bus, "heroes", EventAction::Create, vec![42]).await;
+        publish(&bus, "widgets", EventAction::Create, vec![42]).await;
         let body = first_frames(response, 2).await;
         assert!(body.contains("event: create"), "{body}");
         assert!(body.contains(r#""ids":[42]"#), "{body}");
@@ -239,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn the_stream_ends_when_the_bus_goes_away() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "heroes", Some("sub-3"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", Some("sub-3"), &HeaderMap::new())
             .await
             .unwrap();
         drop(bus);
@@ -253,17 +271,17 @@ mod tests {
     #[tokio::test]
     async fn keep_alive_comments_are_skipped_before_the_first_real_event() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "heroes", Some("sub-4"), &HeaderMap::new())
+        let response = event_stream(&bus, "widgets", Some("sub-4"), &HeaderMap::new())
             .await
             .unwrap();
         let publish_after_a_few_keep_alives = async {
             tokio::time::sleep(KEEP_ALIVE_INTERVAL * 5).await;
-            publish(&bus, "heroes", EventAction::Create, vec![7]).await;
+            publish(&bus, "widgets", EventAction::Create, vec![7]).await;
         };
         // The subscriber frame, then at least one keep-alive comment (which
         // `first_frames` must skip via its `starts_with(':')` branch) before
         // the real `create` frame that ends the count.
-        let (_, body) = tokio::join!(publish_after_a_few_keep_alives, first_frames(response, 2));
+        let ((), body) = tokio::join!(publish_after_a_few_keep_alives, first_frames(response, 2));
         assert!(body.contains("event: subscriber"), "{body}");
         assert!(body.contains("event: create"), "{body}");
     }

@@ -1,43 +1,45 @@
-//! Query parsing and OLS forecasting for the generic `/stats`/`/predict`
-//! routes -- port of `controllers/crud_stats.py`, narrowed to operate
-//! directly against Hero rather than being generic over any `Repository`
-//! (this instance has one resource; see `docs/adrs/0015` for why that
-//! narrowing is the honest choice here rather than premature genericity
-//! over a capability with a single call site).
+//! Query parsing and OLS forecasting for the generic `/stats` and `/predict`
+//! routes. A resource's field table ([`FieldSpec`]) decides which fields
+//! take part; the handlers that read the data stay in the host.
 //!
-//! `forecast()` is a plain ordinary-least-squares linear regression over
-//! `(bucket_index, value)` pairs -- stdlib arithmetic only, no ML crate,
-//! matching the reference's own `forecast()` and its ADR
-//! (`docs/adrs/0017-linear-forecast-and-json-only-events-for-crud-
-//! stats.md` in template-fastapi, ported here as `docs/adrs/0015`).
+//! [`forecast`] is a plain ordinary-least-squares linear regression over
+//! `(bucket_index, value)` pairs: standard-library arithmetic only, no ML
+//! crate. It is a naive trend projection, not a trained model.
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 
-use crate::generic::controllers::crud_query::{FieldKind, FieldSpec};
-use crate::generic::views::FieldError;
-use crate::problem_details::AppError;
+use crate::controllers::crud_query::{FieldKind, FieldSpec};
+use crate::error::CrudError;
+use crate::views::FieldError;
 
-/// A predicted series longer than this would be a near-meaningless naive
-/// linear projection anyway -- caps `?periods=` the same way
-/// `crud::MAX_LIMIT` caps `?limit=`.
+/// The fewest future buckets a prediction may ask for.
 pub const MIN_PERIODS: u32 = 1;
+/// The most future buckets a prediction may ask for: a longer naive linear
+/// projection is near-meaningless, so this caps `?periods=` the way
+/// [`MAX_LIMIT`](crate::crud::MAX_LIMIT) caps `?limit=`.
 pub const MAX_PERIODS: u32 = 52;
+/// The number of future buckets projected when the caller names none.
 pub const DEFAULT_PERIODS: u32 = 4;
 
-/// How many matching records `/stats`/`/predict` read to compute their
-/// aggregates -- a sanity bound, not a precise one (this is a demo/
-/// reporting feature, not a paginated listing), matching the reference's
-/// own `MAX_HISTORY_RECORDS`.
+/// How many matching records `/stats`/`/predict` should read to compute
+/// their aggregates: a sanity bound, not a precise one, since these are
+/// reporting features rather than paginated listings.
 pub const MAX_HISTORY_RECORDS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The width of one time bucket of a stats or prediction series.
 pub enum TimeBucket {
+    /// One calendar day.
     Day,
+    /// One week.
     Week,
+    /// One calendar month.
     Month,
 }
 
 impl TimeBucket {
+    /// Parse a `?bucket=` value (`day`, `week` or `month`).
+    #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "day" => Some(Self::Day),
@@ -47,6 +49,8 @@ impl TimeBucket {
         }
     }
 
+    /// The wire name of this bucket width.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Day => "day",
@@ -57,9 +61,9 @@ impl TimeBucket {
 }
 
 /// Fields eligible for numeric stats/predict: `FieldKind::Number` only --
-/// `FieldKind::DateTime` is excluded the same way the reference excludes
-/// date/datetime fields from `numeric_fields` (averaging/summing a
-/// timestamp has no sensible meaning as an aggregate statistic).
+/// `FieldKind::DateTime` is excluded (averaging or summing a timestamp has no
+/// sensible meaning as an aggregate statistic).
+#[must_use]
 pub fn numeric_fields(specs: &[FieldSpec]) -> Vec<&'static str> {
     specs
         .iter()
@@ -69,6 +73,7 @@ pub fn numeric_fields(specs: &[FieldSpec]) -> Vec<&'static str> {
 }
 
 /// Fields eligible for a categorical value distribution.
+#[must_use]
 pub fn categorical_fields(specs: &[FieldSpec]) -> Vec<&'static str> {
     specs
         .iter()
@@ -86,7 +91,7 @@ pub fn categorical_counts<T>(
     records: &[T],
     fields: &[&'static str],
     value_of: impl Fn(&T, &str) -> Option<bool>,
-) -> Vec<crate::generic::views::stats::CategoricalValueCount> {
+) -> Vec<crate::views::stats::CategoricalValueCount> {
     fields
         .iter()
         .flat_map(|&field| {
@@ -98,7 +103,7 @@ pub fn categorical_counts<T>(
                 }
             }
             counts.into_iter().map(move |(value, count)| {
-                crate::generic::views::stats::CategoricalValueCount {
+                crate::views::stats::CategoricalValueCount {
                     field,
                     value,
                     count,
@@ -108,21 +113,30 @@ pub fn categorical_counts<T>(
         .collect()
 }
 
-pub fn parse_bucket(raw: Option<&String>) -> Result<Option<TimeBucket>, AppError> {
+/// Parse an optional `?bucket=` value.
+///
+/// # Errors
+///
+/// [`CrudError::UnprocessableEntity`] when the value is not a known bucket.
+pub fn parse_bucket(raw: Option<&String>) -> Result<Option<TimeBucket>, CrudError> {
     match raw {
         None => Ok(None),
         Some(raw) => TimeBucket::parse(raw).map(Some).ok_or_else(|| {
-            AppError::UnprocessableEntity(vec![FieldError::new("bucket", "invalid bucket")])
+            CrudError::UnprocessableEntity(vec![FieldError::new("bucket", "invalid bucket")])
         }),
     }
 }
 
 /// Validate `?field=` names a numeric field of `specs`, or return `None`
 /// if omitted.
+///
+/// # Errors
+///
+/// [`CrudError::UnprocessableEntity`] when the field is not numeric.
 pub fn parse_predict_field(
     specs: &[FieldSpec],
     raw: Option<&String>,
-) -> Result<Option<&'static str>, AppError> {
+) -> Result<Option<&'static str>, CrudError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -131,19 +145,25 @@ pub fn parse_predict_field(
         .find(|field| *field == raw)
         .map(Some)
         .ok_or_else(|| {
-            AppError::UnprocessableEntity(vec![FieldError::new("field", "not a numeric field")])
+            CrudError::UnprocessableEntity(vec![FieldError::new("field", "not a numeric field")])
         })
 }
 
-pub fn parse_periods(raw: Option<&String>) -> Result<u32, AppError> {
+/// Parse an optional `?periods=` value, defaulting to [`DEFAULT_PERIODS`].
+///
+/// # Errors
+///
+/// [`CrudError::UnprocessableEntity`] when the value is not an integer in
+/// `1..=`[`MAX_PERIODS`].
+pub fn parse_periods(raw: Option<&String>) -> Result<u32, CrudError> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_PERIODS);
     };
     let periods: u32 = raw.parse().map_err(|_| {
-        AppError::UnprocessableEntity(vec![FieldError::new("periods", "must be an integer")])
+        CrudError::UnprocessableEntity(vec![FieldError::new("periods", "must be an integer")])
     })?;
     if !(MIN_PERIODS..=MAX_PERIODS).contains(&periods) {
-        return Err(AppError::UnprocessableEntity(vec![FieldError::new(
+        return Err(CrudError::UnprocessableEntity(vec![FieldError::new(
             "periods",
             format!("must be between {MIN_PERIODS} and {MAX_PERIODS}"),
         )]));
@@ -156,7 +176,9 @@ pub fn parse_periods(raw: Option<&String>) -> Result<u32, AppError> {
 /// series (`value` is the count, as a float).
 #[derive(Debug, Clone, Copy)]
 pub struct BucketValue {
+    /// Start of the bucket.
     pub bucket_start: NaiveDateTime,
+    /// The bucket's value.
     pub value: f64,
 }
 
@@ -164,26 +186,22 @@ pub struct BucketValue {
 /// value.
 #[derive(Debug, Clone, Copy)]
 pub struct Prediction {
+    /// Start of the projected bucket.
     pub bucket_start: NaiveDateTime,
+    /// The projected value.
     pub value: f64,
 }
 
-/// Truncate `value` to the start of its UTC calendar bucket -- mirrors
-/// the reference's own `_bucket_start` helper.
+/// Truncate `value` to the start of its UTC calendar bucket.
+#[must_use]
 pub fn bucket_start(bucket: TimeBucket, value: NaiveDateTime) -> NaiveDateTime {
-    let day_start = value
-        .date()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always valid");
+    let day_start = value.date().and_time(NaiveTime::MIN);
     match bucket {
         TimeBucket::Day => day_start,
         TimeBucket::Week => {
-            day_start - Duration::days(day_start.weekday().num_days_from_monday() as i64)
+            day_start - Duration::days(i64::from(day_start.weekday().num_days_from_monday()))
         }
-        TimeBucket::Month => NaiveDate::from_ymd_opt(day_start.year(), day_start.month(), 1)
-            .expect("year/month from an existing date is always valid")
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid"),
+        TimeBucket::Month => day_start - Duration::days(i64::from(day_start.day0())),
     }
 }
 
@@ -193,7 +211,7 @@ fn advance(start: NaiveDateTime, bucket: TimeBucket, steps: i64) -> NaiveDateTim
         TimeBucket::Day => start + Duration::days(steps),
         TimeBucket::Week => start + Duration::weeks(steps),
         TimeBucket::Month => {
-            let month_index = start.month0() as i64 + steps;
+            let month_index = i64::from(start.month0()) + steps;
             let year = start.year() + i32::try_from(month_index.div_euclid(12)).unwrap_or(0);
             let month = u32::try_from(month_index.rem_euclid(12)).unwrap_or(0) + 1;
             NaiveDate::from_ymd_opt(year, month, 1)
@@ -208,11 +226,20 @@ fn advance(start: NaiveDateTime, bucket: TimeBucket, steps: i64) -> NaiveDateTim
 /// problem in this layer uses.
 #[derive(Debug)]
 pub struct InsufficientHistory {
+    /// How many buckets of history exist.
     pub have: usize,
 }
 
 /// Project `periods` future buckets via ordinary-least-squares linear
 /// regression. `series` must already be ordered oldest-first.
+///
+/// # Errors
+///
+/// [`InsufficientHistory`] when `series` has fewer than two buckets.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "series are at most a few hundred buckets; far below f64's 2^52 exact-integer range"
+)]
 pub fn forecast(
     series: &[BucketValue],
     periods: u32,
@@ -245,6 +272,10 @@ pub fn forecast(
 /// itself never produces an all-equal `xs` (it's always `0..n` for
 /// `n >= 2`, whose variance is never zero), but the guard still has to be
 /// correct for any other caller.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "series are at most a few hundred buckets; far below f64's 2^52 exact-integer range"
+)]
 fn slope_intercept(xs: &[f64], ys: &[f64]) -> (f64, f64) {
     let n = xs.len() as f64;
     let mean_x = xs.iter().sum::<f64>() / n;
@@ -328,10 +359,10 @@ mod tests {
     #[test]
     fn forecast_projects_a_straight_line_trend() {
         // A perfect line: value = bucket_index (0, 1, 2, 3).
-        let series: Vec<BucketValue> = (0..4)
+        let series: Vec<BucketValue> = (0..4_i32)
             .map(|i| BucketValue {
-                bucket_start: dt(2027, 1, 1) + Duration::days(i),
-                value: i as f64,
+                bucket_start: dt(2027, 1, 1) + Duration::days(i64::from(i)),
+                value: f64::from(i),
             })
             .collect();
         let predictions = forecast(&series, 2, TimeBucket::Day).unwrap();
@@ -395,6 +426,14 @@ mod tests {
         assert_eq!(counts[0].count, 1);
         assert_eq!(counts[1].value, "true");
         assert_eq!(counts[1].count, 2);
+    }
+
+    #[test]
+    fn categorical_counts_skips_records_without_a_value_for_the_field() {
+        let records = [Some(true), None, Some(true)];
+        let counts = categorical_counts(&records, &["flag"], |record, _field| *record);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].count, 2);
     }
 
     #[test]

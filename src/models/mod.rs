@@ -1,17 +1,11 @@
-//! The generic Model layer: resource-agnostic model-layer contracts only
-//! -- no concrete SeaORM entity lives here (Hero's is
-//! `crate::hero::models::hero`). Lowest layer besides `config`/`oidc`
-//! (see `src/README.md`'s "Layering") -- never imports from
-//! `views`/`repositories`/`crud`/`health`/`controllers`, generic or
-//! resource-specific.
+//! Resource-agnostic model-layer contracts only: no concrete entity lives
+//! here. The lowest layer: it never imports from the other modules.
 
-/// A model with a stable integer identity -- lets generic, resource-
-/// agnostic code above this layer (`generic::controllers::crud_actions`)
-/// report which records a bulk action touched without needing resource-
-/// specific knowledge of the concrete model's shape. Defined here (the
-/// lowest layer) rather than in `repositories`/`crud` so a model's own
-/// file can implement it without those higher layers needing to be
-/// visible to `models` (`src/README.md`'s layering is one-directional).
+/// A model with a stable integer identity, so generic code above this layer
+/// (for example [`controllers::crud_actions`](crate::controllers::crud_actions))
+/// can report which records a bulk action touched without knowing the
+/// concrete model's shape.
 pub trait HasId {
+    /// The record's id.
     fn id(&self) -> i32;
 }

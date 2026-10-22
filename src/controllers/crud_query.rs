@@ -1,34 +1,24 @@
-//! Query-string parsing for the generic CRUD router -- port of
-//! `controllers/crud_query.py`. `FieldSpec`/`parse_filters`/`parse_sort`
-//! are fully generic over any resource's field table; only the table
-//! itself (e.g. `heroes::HERO_FIELD_SPECS`) is resource-specific, the same
-//! division the reference draws between this module (generic) and each
-//! resource's own Pydantic schema (resource-specific).
+//! Query-string parsing for the generic CRUD routes. [`FieldSpec`],
+//! [`parse_filters`] and [`parse_sort`] are fully generic over any
+//! resource's field table; only the table itself is resource-specific.
 //!
-//! Wire format matches the reference: `field=value` is an equality match;
-//! `field__min=`/`field__max=` express a range; `field__in=a,b,c` is
-//! membership; `field__contains=`/`field__icontains=` are string
-//! operators. `sort=field,-other_field` is comma-separated, a leading `-`
-//! meaning descending.
+//! Wire format: `field=value` is an equality match; `field__min=` and
+//! `field__max=` express a range; `field__in=a,b,c` is membership;
+//! `field__contains=` and `field__icontains=` are string operators.
+//! `sort=field,-other_field` is comma-separated, a leading `-` meaning
+//! descending.
 //!
-//! Deviations from the reference, documented rather than silently
-//! dropped:
-//! - No `FilterOp::Regex`/`field__regex=` -- see
-//!   `repositories/filtering.rs`'s module doc for why.
-//! - No Enum/Literal field kind -- Hero, the only resource this port has,
-//!   has none, and there's no Pydantic-style runtime schema reflection in
-//!   Rust to derive one generically from.
-//! - Every numeric-kind field here is either a bare integer or a
-//!   datetime, so `FieldKind` splits `Number`/`DateTime` rather than the
-//!   reference's single "number" kind dispatching on a captured Python
-//!   type at cast time.
+//! There is no `field__regex=` (see [`crate::repositories::filtering`]) and
+//! no enum field kind. [`FieldKind`] splits `Number` from `DateTime` rather
+//! than using one "number" kind that dispatches on a runtime type.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use chrono::{NaiveDateTime, Utc};
 
-use crate::generic::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
-use crate::generic::views::FieldError;
+use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
+use crate::views::FieldError;
 
 /// Query params never treated as a filter/sort key, regardless of a
 /// resource's own field table.
@@ -38,39 +28,52 @@ const RESERVED_PARAMS: &[&str] = &["id", "skip", "limit", "sort", "include_archi
 /// and how a raw query-string value is cast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
+    /// An integer or floating-point number.
     Number,
+    /// A timestamp.
     DateTime,
+    /// Free text.
     String,
+    /// A boolean.
     Boolean,
 }
 
 /// One field a resource's routes accept as a filter/sort target.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldSpec {
+    /// The query-string key and the model field name.
     pub name: &'static str,
+    /// How values are cast and which operators are accepted.
     pub kind: FieldKind,
 }
 
 impl FieldSpec {
+    /// A numeric field.
+    #[must_use]
     pub const fn number(name: &'static str) -> Self {
         Self {
             name,
             kind: FieldKind::Number,
         }
     }
+    /// A timestamp field.
+    #[must_use]
     pub const fn datetime(name: &'static str) -> Self {
         Self {
             name,
             kind: FieldKind::DateTime,
         }
     }
+    /// A text field.
+    #[must_use]
     pub const fn string(name: &'static str) -> Self {
         Self {
             name,
             kind: FieldKind::String,
         }
     }
-    #[allow(dead_code)] // no Hero field is Boolean yet; kept for parity with the reference's kind table
+    /// A boolean field.
+    #[must_use]
     pub const fn boolean(name: &'static str) -> Self {
         Self {
             name,
@@ -108,10 +111,8 @@ fn split_key(key: &str) -> (&str, &str) {
     }
 }
 
-/// Parse an ISO datetime, normalizing a tz-aware value to naive UTC --
-/// every timestamp this app stores is naive-but-conceptually-UTC (see
-/// `models::hero::Model`), matching `crud_query.py`'s own
-/// `_cast_datetime`.
+/// Parse an ISO datetime, normalizing a tz-aware value to naive UTC: every
+/// timestamp the crate handles is naive but conceptually UTC.
 fn cast_datetime(raw: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
         return Some(dt.with_timezone(&Utc).naive_utc());
@@ -135,11 +136,15 @@ fn cast_one(kind: FieldKind, raw: &str) -> Option<FilterValue> {
 /// Parse every non-reserved query param into a `FilterClause`, validated
 /// against `specs`. An unrecognized field name, an operator not valid for
 /// that field's kind, or a value that doesn't parse as that field's type
-/// collects a `FieldError` rather than being silently ignored -- the
-/// caller renders the result as `AppError::UnprocessableEntity`.
-pub fn parse_filters(
+/// collects a `FieldError` rather than being silently ignored.
+///
+/// # Errors
+///
+/// Every offending parameter, as [`FieldError`]s; a caller wraps them in
+/// [`CrudError::UnprocessableEntity`](crate::error::CrudError::UnprocessableEntity).
+pub fn parse_filters<S: BuildHasher>(
     specs: &[FieldSpec],
-    params: &HashMap<String, String>,
+    params: &HashMap<String, String, S>,
 ) -> Result<Vec<FilterClause>, Vec<FieldError>> {
     let mut clauses = Vec::new();
     let mut errors = Vec::new();
@@ -148,28 +153,27 @@ pub fn parse_filters(
             continue;
         }
         let (field, suffix) = split_key(key);
-        let spec = specs.iter().find(|spec| spec.name == field);
-        let Some(spec) = spec.filter(|spec| ops_for(spec.kind).contains(&suffix)) else {
+        let known = specs
+            .iter()
+            .find(|spec| spec.name == field)
+            .filter(|spec| ops_for(spec.kind).contains(&suffix))
+            .and_then(|spec| suffix_to_op(suffix).map(|op| (spec, op)));
+        let Some((spec, op)) = known else {
             errors.push(FieldError::new(
                 "query",
                 format!("unrecognized filter {key:?}"),
             ));
             continue;
         };
-        // `suffix` is already validated against `ops_for(spec.kind)` above,
-        // so every remaining suffix maps to a real FilterOp.
-        let op = suffix_to_op(suffix).expect("suffix already validated against ops_for");
-
         let value = if op == FilterOp::In {
             let mut values = Vec::new();
             let mut invalid = false;
             for part in raw.split(',') {
-                match cast_one(spec.kind, part) {
-                    Some(value) => values.push(value),
-                    None => {
-                        invalid = true;
-                        break;
-                    }
+                if let Some(value) = cast_one(spec.kind, part) {
+                    values.push(value);
+                } else {
+                    invalid = true;
+                    break;
                 }
             }
             if invalid {
@@ -181,16 +185,14 @@ pub fn parse_filters(
             }
             FilterValue::List(values)
         } else {
-            match cast_one(spec.kind, raw) {
-                Some(value) => value,
-                None => {
-                    errors.push(FieldError::new(
-                        "query",
-                        format!("invalid filter value for {key:?}"),
-                    ));
-                    continue;
-                }
-            }
+            let Some(value) = cast_one(spec.kind, raw) else {
+                errors.push(FieldError::new(
+                    "query",
+                    format!("invalid filter value for {key:?}"),
+                ));
+                continue;
+            };
+            value
         };
         clauses.push(FilterClause {
             field: field.to_string(),
@@ -207,9 +209,13 @@ pub fn parse_filters(
 
 /// Parse a `sort=a,-b` query param into `SortClause`s, validated against
 /// `specs`.
-pub fn parse_sort(
+///
+/// # Errors
+///
+/// Every unrecognized sort field, as [`FieldError`]s.
+pub fn parse_sort<S: BuildHasher>(
     specs: &[FieldSpec],
-    params: &HashMap<String, String>,
+    params: &HashMap<String, String, S>,
 ) -> Result<Vec<SortClause>, Vec<FieldError>> {
     let Some(raw) = params.get("sort") else {
         return Ok(vec![]);
@@ -284,10 +290,7 @@ mod tests {
     fn in_suffix_splits_on_commas() {
         let clauses = parse_filters(SPECS, &params(&[("id__in", "1,2,3")])).unwrap();
         assert_eq!(clauses[0].op, FilterOp::In);
-        let FilterValue::List(values) = &clauses[0].value else {
-            panic!("expected a list value");
-        };
-        assert_eq!(values.len(), 3);
+        assert!(matches!(&clauses[0].value, FilterValue::List(values) if values.len() == 3));
     }
 
     #[test]
@@ -312,7 +315,9 @@ mod tests {
     fn datetime_field_accepts_rfc3339_and_normalizes_to_naive_utc() {
         let clauses =
             parse_filters(SPECS, &params(&[("created_at", "2027-01-01T00:00:00Z")])).unwrap();
-        assert!(matches!(clauses[0].value, FilterValue::DateTime(_)));
+        let expected =
+            NaiveDateTime::parse_from_str("2027-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(clauses[0].value, FilterValue::DateTime(expected));
     }
 
     #[test]
@@ -354,7 +359,7 @@ mod tests {
         .unwrap();
         // "id" here is ambiguous with the reserved param of the same name --
         // RESERVED_PARAMS wins, so it's never parsed as a filter.
-        assert!(clauses.is_empty());
+        assert_eq!(clauses, Vec::<FilterClause>::new());
     }
 
     #[test]
@@ -414,8 +419,9 @@ mod tests {
     fn cast_datetime_falls_back_to_a_naive_non_rfc3339_timestamp() {
         let clauses =
             parse_filters(SPECS, &params(&[("created_at", "2024-01-01T12:00:00")])).unwrap();
-        assert_eq!(clauses.len(), 1);
-        assert!(matches!(clauses[0].value, FilterValue::DateTime(_)));
+        let expected =
+            NaiveDateTime::parse_from_str("2024-01-01 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(clauses[0].value, FilterValue::DateTime(expected));
     }
 
     #[test]
