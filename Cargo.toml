@@ -11,7 +11,7 @@ edition = "2024"
 # Matches rust-toolchain.toml (major.minor is enough for MSRV semantics).
 rust-version = "1.99"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/craftainer/template-rust-crate"
+repository = "https://github.com/craftainer/lib-crud-rs"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -22,10 +22,10 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [package]
-# The template carries its own name; an instance renames it to
-# `craftainer-<name>` (see README.md).
-name = "template-rust-crate"
-description = "Template repository for publishable Rust crates"
+name = "craftainer-crud"
+description = "Generic async CRUD layer for Axum services: repository trait, filtering, bulk actions, stats and SSE events"
+keywords = ["crud", "axum", "rest", "repository", "sse"]
+categories = ["web-programming", "asynchronous"]
 readme = "README.md"
 # Stays 0.0.0 in git: the release tag is the real version. `publish` is left
 # at Cargo's default (true) and gated by the release contract's
@@ -40,7 +40,34 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Exact pins (`=x.y.z`), as in template-axum, so Renovate bumps them one at a
+# time.
 [dependencies]
+async-trait = "=0.1.92"
+axum = { version = "=0.8.9", default-features = false, features = ["json", "tokio"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+futures = { version = "=0.3.34", default-features = false, features = ["std"] }
+getrandom = "=0.4.3"
+rumqttc = { version = "=0.25.1", default-features = false, optional = true }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", features = ["sync", "time"] }
+tracing = "=0.1.44"
+
+[dev-dependencies]
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "derive"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[features]
+# Off by default, like the Python package's extra: the in-memory event bus
+# needs no broker. `mqtt` adds the Mosquitto-backed bus (`EventBus::connect`).
+mqtt = ["dep:rumqttc", "tokio/rt"]
 
 [lints]
 workspace = true
+
+# Needs a live MQTT broker (`MQTT_HOST`/`MQTT_PORT`) and the `mqtt` feature.
+[[test]]
+name = "mqtt_events"
+required-features = ["mqtt"]

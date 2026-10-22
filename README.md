@@ -1,54 +1,50 @@
-# template-rust-crate
+# lib-crud-rs
 
 > [!NOTE]
 > This repository is vibe coded with [Claude](https://claude.com/product/claude-code).
 
-A template for a tested, linted and publishable Rust library crate: a Cargo
-workspace with one example crate, `rustfmt`, `clippy -D warnings`, a 100%
-line-coverage gate (`cargo-llvm-cov`), `cargo-deny`, `cargo-semver-checks`,
-and a release that publishes to crates.io through trusted publishing. It is
-itself an instance of
-[`template-base`](https://github.com/craftainer/template-base) (so it gets the
-devcontainer, CI, release workflow and template sync from there) and is
-itself a template: a crate created from it receives fixes through template
-sync. See [`docs/TEMPLATE.md`](docs/TEMPLATE.md) for the conventions shared
-by every instance, and
-[`docs/adrs/0001-rust-crate-template.md`](docs/adrs/0001-rust-crate-template.md)
-for why it exists.
+`craftainer-crud` (imported as `craftainer_crud`): the generic async CRUD
+layer for [Axum](https://github.com/tokio-rs/axum) services, extracted from
+[`template-axum`](https://github.com/craftainer/template-axum). It is an
+instance of
+[`template-rust-crate`](https://github.com/craftainer/template-rust-crate)
+(so it gets the devcontainer, CI, release workflow and template sync from
+there); see [`docs/TEMPLATE.md`](docs/TEMPLATE.md) for the conventions shared
+by every instance and
+[`docs/adrs/0002-extract-the-generic-crud-layer.md`](docs/adrs/0002-extract-the-generic-crud-layer.md)
+for why the crate exists and where its boundary is.
 
-## Creating a crate from this template
+The crate is the resource-agnostic half of a CRUD service. A host application
+supplies one `Repository` implementation per resource (any storage) and the
+crate supplies the rest:
 
-1. On GitHub, use "Use this template" on this repository (or
-   `gh repo create <org>/<name> --template craftainer/template-rust-crate`).
-2. Rename the crate. The convention for this organization is
-   `craftainer-<name>` on crates.io (repository `lib-<name>-rs`), imported as
-   `craftainer_<name>`. These places move together:
-   - `Cargo.toml`: `[package] name` (`template-rust-crate`), the
-     description, and `[workspace.package] repository`;
-   - `src/lib.rs`: the `template_rust_crate::` path in the doctest;
-   - `tests/*.rs`: every `use template_rust_crate::…`;
-   - this file's title and description.
+- `crud::CrudService`, a thin service over any repository;
+- `repositories::filtering` and `controllers::crud_query`, the filter and
+  sort vocabulary and its query-string parser;
+- `controllers::crud_actions`, list-or-get, update and delete with bulk
+  actions and a size cap;
+- `controllers::crud_stats` and `views::stats`, building blocks for stats and
+  prediction endpoints;
+- `events` and `controllers::crud_events`, a publish/subscribe bus and its
+  Server-Sent Events stream;
+- `error::CrudError`, the error every one of them returns, rendered as
+  `application/problem+json`.
 
-   Then run `cargo update --workspace` to refresh `Cargo.lock` for the new
-   name, and add `keywords` and `categories` to `[package]`.
-3. Point template sync at this template. `.github/template-sync-state.json`
-   here records the `template-base` tag this template itself last synced
-   from; the copy in a new crate must instead name this repository and the
-   tag it was created at (the latest release of
-   `craftainer/template-rust-crate`):
+A host keeps its own error type and converts with `From<CrudError>`.
 
-   ```json
-   {"template_repo": "craftainer/template-rust-crate", "synced_tag": "vX.Y.Z"}
-   ```
+## Features
 
-   Add a `TEMPLATE_SYNC_TOKEN` secret too (see `.github/workflows/README.md`,
-   "Template sync"). Files the crate owns beyond the manifest's `ignore`
-   tier go in `.github/template-sync-manifest.local.yml` under `ignore:`.
-4. Open the repository in the devcontainer, then run
-   `prek run --all-files --hook-stage manual`; everything should pass before
-   you write any code.
-5. Keep `LICENSE` (GPL-3.0) and `deny.toml`'s license allow-list, or change
-   both together.
+- `mqtt` (off by default): `EventBus::connect`, an MQTT-backed bus with
+  persistent subscriber sessions. Without it only the in-memory bus
+  (`EventBus::mock`) exists.
+
+## Development
+
+Open the repository in the devcontainer: it starts Postgres and Mosquitto,
+which the integration tests need (`tests/README.md`). Then run
+`prek run --all-files --hook-stage manual`; that runs `rustfmt`,
+`clippy -D warnings`, the tests with a 100% line-coverage gate, `cargo-deny`
+and the template-sync manifest check.
 
 ## Publishing to crates.io
 
