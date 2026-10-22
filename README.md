@@ -32,6 +32,25 @@ crate supplies the rest:
 
 A host keeps its own error type and converts with `From<CrudError>`.
 
+The query and bulk behaviour follows
+[`lib-crud-py`](https://github.com/craftainer/lib-crud-py), the server source
+of truth for the SDKs; [ADR 0003](docs/adrs/0003-match-lib-crud-py-and-harden-events.md)
+lists where and why. Things a host needs to know:
+
+- Extract query params as `Query<Vec<(String, String)>>` and pass the slice to
+  `parse_filters`/`parse_sort`: clauses and errors keep the request's order.
+- `?id=` together with filters is a `422` (Python silently ignores the
+  filters; see the ADR).
+- The bulk cap is a check followed by a write, not one atomic step.
+- Event streams use server-minted, per-resource subscriber ids, cap the
+  streams that start without one, answer `503` when the broker is down and
+  `429` over the cap. Pass `EventBus::with_subscriber_secret` the same secret on
+  every instance (and across restarts) if clients should resume. Delivery
+  covers events that reached the broker; a publish can still be dropped before
+  that (see `events`).
+- A repository must honour the `owner_id` equality clause that bulk actions
+  append (see `Repository`).
+
 ## Features
 
 - `mqtt` (off by default): `EventBus::connect`, an MQTT-backed bus with

@@ -49,6 +49,8 @@ pub enum FilterValue {
     Str(String),
     /// An integer.
     Int(i64),
+    /// A floating-point number.
+    Float(f64),
     /// A timestamp.
     DateTime(NaiveDateTime),
     /// A boolean.
