@@ -4,7 +4,7 @@
 //! router (JSON, XML, HTML, ...) reuses the same decisions instead of
 //! duplicating them.
 
-use crate::crud::CrudService;
+use crate::crud::{CrudService, owner_scoped};
 use crate::error::CrudError;
 use crate::models::HasId;
 use crate::repositories::Repository;
@@ -120,7 +120,9 @@ where
     if filters.is_empty() {
         return Err(no_target_error());
     }
-    let matched = crud.count(&filters, false).await?;
+    let matched = crud
+        .count(&owner_scoped(owner_id, filters.clone()), false)
+        .await?;
     if matched > max_matched {
         return Err(too_many_matched_error(matched, max_matched));
     }
@@ -182,7 +184,9 @@ where
     if filters.is_empty() {
         return Err(no_target_error());
     }
-    let matched = crud.count(&filters, false).await?;
+    let matched = crud
+        .count(&owner_scoped(owner_id, filters.clone()), false)
+        .await?;
     if matched > max_matched {
         return Err(too_many_matched_error(matched, max_matched));
     }

@@ -70,17 +70,18 @@ async fn drive_publisher_eventloop<P: MqttPoll>(mut eventloop: P) {
     }
 }
 
-/// Queue `value` as a JSON `QoS` 1, non-retained message on `topic`.
+/// Queue `value` as a JSON `QoS` 1, non-retained message on `topic`, without
+/// waiting: a full request queue (broker unreachable) is an error, so a CRUD
+/// handler never hangs on a side-channel notification.
 #[cfg(feature = "mqtt")]
-async fn publish_json<T: serde::Serialize + ?Sized>(
+fn publish_json<T: serde::Serialize + ?Sized>(
     publisher: &AsyncClient,
     topic: String,
     value: &T,
 ) -> Result<(), String> {
     let payload = serde_json::to_vec(value).map_err(|err| err.to_string())?;
     publisher
-        .publish(topic, QoS::AtLeastOnce, false, payload)
-        .await
+        .try_publish(topic, QoS::AtLeastOnce, false, payload)
         .map_err(|err| err.to_string())
 }
 
@@ -326,19 +327,16 @@ impl EventBus {
     /// propagated: a CRUD write that already succeeded must not be reported
     /// to the caller as failed because a side-channel notification could
     /// not be delivered.
-    #[cfg_attr(
-        not(feature = "mqtt"),
-        expect(
-            clippy::unused_async,
-            clippy::unused_async_trait_impl,
-            reason = "the signature is the same with and without the `mqtt` feature"
-        )
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "kept async so the signature is stable and the same with and without the `mqtt` feature"
     )]
     pub async fn publish(&self, event: CrudEvent) {
         match &self.backend {
             #[cfg(feature = "mqtt")]
             Backend::Mqtt { publisher, .. } => {
-                if let Err(err) = publish_json(publisher, topic(&event.resource), &event).await {
+                if let Err(err) = publish_json(publisher, topic(&event.resource), &event) {
                     tracing::warn!("failed to publish CRUD event: {err}");
                 }
             }
@@ -843,9 +841,7 @@ mod tests {
     #[tokio::test]
     async fn publish_json_reports_an_encoding_failure() {
         let client = client_with_closed_request_channel();
-        let err = publish_json(&client, "t".to_string(), &Unencodable)
-            .await
-            .unwrap_err();
+        let err = publish_json(&client, "t".to_string(), &Unencodable).unwrap_err();
         assert!(err.contains("cannot encode"), "{err}");
     }
 

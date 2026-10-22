@@ -148,7 +148,7 @@ where
     }
 }
 
-fn owner_scoped(owner_id: &str, mut filters: Vec<FilterClause>) -> Vec<FilterClause> {
+pub(crate) fn owner_scoped(owner_id: &str, mut filters: Vec<FilterClause>) -> Vec<FilterClause> {
     filters.push(FilterClause {
         field: "owner_id".to_string(),
         op: FilterOp::Eq,
