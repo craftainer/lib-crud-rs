@@ -4,13 +4,17 @@
 //! router (JSON, XML, HTML, ...) reuses the same decisions instead of
 //! duplicating them.
 //!
-//! # `?id=` wins over filters
+//! # `?id=` excludes filters
 //!
-//! When `id` is given, `filters` are ignored: not applied, and not an error.
-//! This is what `lib-crud-py` does (it returns before it parses the filters),
-//! and the manifest lists `id` as a reserved key rather than a filter. A
-//! caller that wants "this record, but only if it matches" filters the list
-//! instead.
+//! A request addresses one record (`id`) or a set of them (filters), never
+//! both: with an `id` and at least one filter every `resolve_*` answers
+//! [`CrudError::UnprocessableEntity`], on a read as well as on a write.
+//! `lib-crud-py` does not refuse: it returns before it parses the filters, so
+//! `DELETE ?id=5&status=draft` there deletes record 5 whatever its status. For
+//! a mutation that turns a guard the caller wrote into a no-op, so this crate
+//! refuses (a deliberate difference, see ADR 0003). The reserved keys
+//! (`skip`, `limit`, `sort`, `include_archived`, ...) are not filters and may
+//! accompany an `id`.
 //!
 //! # The bulk cap is not atomic
 //!
@@ -111,6 +115,17 @@ fn bulk_result<M: HasId>(affected: &[M]) -> BulkResult {
     }
 }
 
+/// `?id=` and filters are alternatives: refuse a request that sends both.
+fn ensure_id_without_filters(filters: &[FilterClause]) -> Result<(), CrudError> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    Err(CrudError::UnprocessableEntity(vec![FieldError::new(
+        NO_TARGET_FIELD,
+        "id cannot be combined with filters",
+    )]))
+}
+
 fn not_found(id: i32) -> CrudError {
     CrudError::NotFound(format!("record {id} not found"))
 }
@@ -119,8 +134,9 @@ fn not_found(id: i32) -> CrudError {
 ///
 /// # Errors
 ///
-/// [`CrudError::NotFound`] when `id` names no record; [`CrudError::Internal`]
-/// when the backend fails.
+/// [`CrudError::NotFound`] when `id` names no record;
+/// [`CrudError::UnprocessableEntity`] when `id` comes with filters;
+/// [`CrudError::Internal`] when the backend fails.
 pub async fn resolve_list_or_get<R>(
     crud: &CrudService<R>,
     id: Option<i32>,
@@ -134,6 +150,7 @@ where
     R: Repository,
 {
     if let Some(id) = id {
+        ensure_id_without_filters(&filters)?;
         let record = crud.get(id, include_archived).await?;
         let record = record.ok_or_else(|| not_found(id))?;
         return Ok(ListOrGet::One(record));
@@ -150,8 +167,8 @@ where
 /// # Errors
 ///
 /// [`CrudError::NotFound`] when `id` names no record owned by `owner_id`;
-/// [`CrudError::UnprocessableEntity`] when neither an id nor a filter was
-/// given, or the filters match more than `max_matched` records;
+/// [`CrudError::UnprocessableEntity`] when `id` comes with filters, when
+/// neither an id nor a filter was given, or the filters match more than `max_matched` records;
 /// [`CrudError::Internal`] when the backend fails.
 pub async fn resolve_update<R>(
     crud: &CrudService<R>,
@@ -166,6 +183,7 @@ where
     R::Model: HasId,
 {
     if let Some(id) = id {
+        ensure_id_without_filters(&filters)?;
         let updated = resolve_update_by_id(crud, id, owner_id, data).await?;
         return Ok(UpdateOutcome::One(updated));
     }
@@ -215,6 +233,7 @@ where
     R::Model: HasId,
 {
     if let Some(id) = id {
+        ensure_id_without_filters(&filters)?;
         let deleted = crud.delete(id, owner_id).await?;
         if !deleted {
             return Err(not_found(id));

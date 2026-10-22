@@ -39,7 +39,8 @@ lists where and why. Things a host needs to know:
 
 - Extract query params as `Query<Vec<(String, String)>>` and pass the slice to
   `parse_filters`/`parse_sort`: clauses and errors keep the request's order.
-- `?id=` wins over filters; filters are ignored when an id is given.
+- `?id=` together with filters is a `422` (Python silently ignores the
+  filters; see the ADR).
 - The bulk cap is a check followed by a write, not one atomic step.
 - Event streams use server-minted, per-resource subscriber ids, cap the
   streams that start without one, answer `503` when the broker is down and

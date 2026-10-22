@@ -16,7 +16,8 @@ match `lib-crud-py`'s behaviour, and where the transport differs on purpose
 server-minted subscriber ids, a resume parameter, per-resource scoping.
 
 Two items of the work order described Python behaviour that Python does not
-have. They are recorded under Decision so the next reader does not "fix" them.
+have (`?id=` with filters, and the forecast's x-axis). They are recorded under
+Decision so the next reader knows which way each was resolved and why.
 
 ## Decision
 
@@ -57,6 +58,14 @@ have. They are recorded under Decision so the next reader does not "fix" them.
 
 **Queries.**
 
+- `?id=` together with filters is a `422` on a read, update and delete. The work
+  order asked for this "as Python does", but Python does not refuse it: it
+  returns before it parses filters, so the filters are ignored and
+  `DELETE ?id=5&status=draft` deletes record 5 whatever its status. A guard the
+  caller wrote that silently does nothing is the more dangerous behaviour for a
+  mutation, and the SDKs send an id or filters, never both, so refusing costs
+  no compatible client anything. This is a deliberate difference from Python.
+
 - `parse_filters` and `parse_sort` take `&[(K, V)]` pairs in wire order instead
   of a `HashMap`. Clauses and errors then come out in request order, which is
   what Python does (`QueryParams.multi_items()`), a repeated key is a repeated
@@ -75,11 +84,6 @@ have. They are recorded under Decision so the next reader does not "fix" them.
 
 **Documented, not changed.**
 
-- `?id=` together with filters: the id wins and the filters are ignored, as in
-  Python (`resolve_*` return on `id is not None` before parsing filters, and
-  the manifest lists `id` as a reserved key). The work order said Python answers
-  422; it does not, and a stricter Rust server would disagree with the other
-  servers the SDKs talk to. Documented on `crud_actions` and covered by a test.
 - Forecast regresses on the position of each point in the series, as Python
   does, not on bucket time. The work order said Python regresses on bucket time;
   it does not (`xs = range(len(series))`). The two differ only for a series with

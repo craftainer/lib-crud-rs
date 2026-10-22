@@ -126,6 +126,12 @@ impl IntoResponse for CrudError {
             detail,
         };
         let mut response = (status, axum::Json(body)).into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/problem+json"),
@@ -196,6 +202,7 @@ mod tests {
     async fn too_many_requests_maps_to_429() {
         let response = CrudError::TooManyRequests("slow down".to_string()).into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         assert_eq!(body_json(response).await["detail"], "slow down");
     }
 

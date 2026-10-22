@@ -40,7 +40,9 @@
 //! budget for the whole bus, so a caller holding that many idle streams can
 //! refuse every first-time subscriber; per-client limits (by IP or by
 //! credential) belong in the host's rate limiter or reverse proxy, in front of
-//! the events route.
+//! the events route. Nor does it limit how many streams run under one issued
+//! id (on MQTT they share a client id, so the broker keeps replacing the older
+//! connection); that too is the host's to rate-limit.
 //!
 //! ## Delivery guarantee (MQTT bus, and its exact scope)
 //!

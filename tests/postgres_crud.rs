@@ -313,39 +313,35 @@ async fn a_float_filter_compares_against_the_stored_column() {
 }
 
 #[tokio::test]
-async fn an_id_wins_over_filters_like_lib_crud_py() {
+async fn an_id_together_with_filters_is_refused_before_anything_runs() {
     let service = seeded().await;
     let all = service.list(0, 100, false, vec![], vec![]).await.unwrap();
     let id = all[0].id;
-    // A filter that cannot match the record is ignored, not a 422 and not
-    // an extra condition: `?id=` addresses the record by itself.
-    let never = filters(&[("quantity__min", "1000")]);
-
-    let ListOrGet::One(one) =
-        resolve_list_or_get(&service, Some(id), 0, 10, false, never.clone(), vec![])
-            .await
-            .unwrap()
-    else {
-        panic!("expected one record");
-    };
-    assert_eq!(one.id, id);
-
-    let patch = WidgetPatch {
+    // `DELETE ?id=..&quantity__min=1000` must not delete the record just
+    // because the guard the caller wrote was dropped.
+    let guard = filters(&[("quantity__min", "1000")]);
+    let patch = || WidgetPatch {
         name: Some("renamed".to_string()),
         quantity: None,
     };
-    assert!(matches!(
-        resolve_update(&service, Some(id), "alice", never.clone(), patch, 10)
-            .await
-            .unwrap(),
-        UpdateOutcome::One(_)
-    ));
-    assert!(matches!(
-        resolve_delete(&service, Some(id), "alice", never, 10)
-            .await
-            .unwrap(),
-        DeleteOutcome::One
-    ));
+
+    let err = resolve_list_or_get(&service, Some(id), 0, 10, false, guard.clone(), vec![])
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, CrudError::UnprocessableEntity(_)));
+    let err = resolve_update(&service, Some(id), "alice", guard.clone(), patch(), 10)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, CrudError::UnprocessableEntity(_)));
+    let err = resolve_delete(&service, Some(id), "alice", guard, 10)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::UnprocessableEntity(_)));
+
+    let untouched = service.get(id, false).await.unwrap().unwrap();
+    assert_eq!(untouched.name, all[0].name);
 }
 
 #[tokio::test]

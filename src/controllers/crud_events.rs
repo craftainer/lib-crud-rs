@@ -131,7 +131,7 @@ pub async fn event_stream(
 fn subscribe_error(err: EventError) -> CrudError {
     match err {
         EventError::TooManyAnonymousConnections => CrudError::TooManyRequests(
-            "too many anonymous event streams; resume with the subscriber_id you were issued"
+            "too many anonymous event streams; retry shortly, or resume with the subscriber_id you were issued"
                 .to_string(),
         ),
         EventError::Broker(detail) => {
