@@ -145,7 +145,8 @@ pub struct Features {
     pub bulk_update: bool,
     /// Bulk `DELETE` by filters.
     pub bulk_delete: bool,
-    /// A `clone` route is mounted.
+    /// A `clone` route is mounted. `paths.clone` is emitted either way (the
+    /// schema requires it), so mount the route or leave this off knowingly.
     pub clone: bool,
     /// `draft` and `publish` routes are mounted.
     pub draft_publish: bool,
@@ -200,7 +201,9 @@ pub struct EventsDescriptor {
 
 impl EventsDescriptor {
     /// A stream under `resource` that carries `create`, `update` and
-    /// `delete`, with the default keep-alive.
+    /// `delete`, with the default keep-alive. A resource with a `restore`
+    /// route also publishes restores: push [`ManifestEventAction::Restore`]
+    /// onto `actions`.
     #[must_use]
     pub fn new(resource: impl Into<String>, replay: Replay) -> Self {
         Self {

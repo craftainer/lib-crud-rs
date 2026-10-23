@@ -290,7 +290,7 @@ async fn route_honours_prefix_and_sees_later_registrations() {
         get(&router, "/api/_crud/manifest", &[]).await.0,
         StatusCode::NOT_FOUND
     );
-    assert_eq!(headers[axum::http::header::VARY], "authorization");
+    assert_eq!(headers[axum::http::header::VARY], "authorization, cookie");
     for (prefix, path) in [("", "/manifest"), ("api", "/api/manifest")] {
         let router = router_for(&registry, prefix);
         assert_eq!(get(&router, path, &[]).await.0, StatusCode::OK, "{prefix}");

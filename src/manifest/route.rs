@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Router;
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, VARY};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, VARY};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -97,8 +97,9 @@ async fn get_manifest(
     let validators = [
         (ETAG, etag.as_str()),
         (CACHE_CONTROL, REVALIDATE_CACHE_CONTROL),
-        // The document depends on who is calling, whatever the resolver reads.
-        (VARY, AUTHORIZATION.as_str()),
+        // The document depends on who is calling. A resolver that reads other
+        // headers should be fronted by a cache that keys on them too.
+        (VARY, "authorization, cookie"),
     ];
     if if_none_match(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, validators).into_response());
