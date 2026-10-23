@@ -18,6 +18,9 @@ this list, except `error`, which `controllers` and `events` use):
   feature).
 - `error.rs` — `CrudError` and its `application/problem+json` rendering.
 - `controllers/` — plain functions a resource's router composes.
+- `manifest/` — the CRUD manifest (contract I1) built from descriptors a
+  host registers, its `GET <prefix>/manifest` router and the `api-catalog`
+  router. Imports `controllers::crud_query`, `crud` and `error`.
 
 ## Do
 

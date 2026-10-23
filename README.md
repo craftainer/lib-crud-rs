@@ -27,6 +27,9 @@ crate supplies the rest:
   prediction endpoints;
 - `events` and `controllers::crud_events`, a publish/subscribe bus and its
   Server-Sent Events stream;
+- `manifest`, the CRUD manifest (contract I1): register a
+  `ResourceDescriptor` per resource, mount `manifest_router` (caller-filtered,
+  weak `ETag`) and `api_catalog_router` (`/.well-known/api-catalog`);
 - `error::CrudError`, the error every one of them returns, rendered as
   `application/problem+json`.
 
@@ -48,6 +51,12 @@ lists where and why. Things a host needs to know:
   every instance (and across restarts) if clients should resume. Delivery
   covers events that reached the broker; a publish can still be dropped before
   that (see `events`).
+- The forecast regresses on bucket time (a gap in the series counts), the
+  same formula as `lib-crud-py`.
+- The manifest is built from what the host registers; see
+  [ADR 0004](docs/adrs/0004-crud-manifest.md) for where it can differ from
+  `lib-crud-py` (no `regex` operator, no enum or date field kinds, bulk
+  event names).
 - A repository must honour the `owner_id` equality clause that bulk actions
   append (see `Repository`).
 

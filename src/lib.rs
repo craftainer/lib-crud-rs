@@ -16,6 +16,8 @@
 //! - [`events`] and [`controllers::crud_events`], a publish/subscribe bus and
 //!   its Server-Sent Events stream (the broker-backed bus is behind the
 //!   `mqtt` feature);
+//! - [`manifest`], the CRUD manifest (contract I1) and the `api-catalog` that
+//!   points at it;
 //! - [`error::CrudError`], the error type all of the above return, rendered as
 //!   RFC 9457 `application/problem+json`.
 //!
@@ -32,6 +34,7 @@ pub mod controllers;
 pub mod crud;
 pub mod error;
 pub mod events;
+pub mod manifest;
 pub mod models;
 pub mod repositories;
 pub mod views;

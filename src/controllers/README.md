@@ -10,7 +10,8 @@ resource's own router composes. There is no router and no axum `State` here.
 - `crud_query.rs` — query string to `FilterClause`/`SortClause`, driven by a
   resource's own `FieldSpec` table.
 - `crud_stats.rs` — the resource-agnostic parts of `/stats` and `/predict`:
-  `TimeBucket`, field-kind narrowing, the OLS `forecast`.
+  `TimeBucket`, field-kind narrowing, the OLS `forecast` (regressed on
+  bucket time, as `lib-crud-py`'s).
 - `crud_events.rs` — the resource-agnostic parts of `GET <prefix>/events`:
   subscriber-id resolution, the SSE frame shape, `publish`.
 
