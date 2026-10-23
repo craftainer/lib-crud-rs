@@ -82,14 +82,16 @@ Decision so the next reader knows which way each was resolved and why.
 - Categorical counts come back fields-in-order, values in first-seen order
   (Python's in-memory repository), instead of hash order.
 
-**Documented, not changed.**
+**Documented, not changed** (the forecast item has since been changed).
 
 - Forecast regresses on the position of each point in the series, as Python
-  does, not on bucket time. The work order said Python regresses on bucket time;
-  it does not (`xs = range(len(series))`). The two differ only for a series with
-  empty buckets, which neither server zero-fills. Changing it in Rust alone
-  would make the same data forecast differently per server, so it is left for a
-  change to both. Documented on `forecast` and covered by a test.
+  did at the time, not on bucket time. The work order said Python regresses on
+  bucket time; it did not (`xs = range(len(series))`). Changing it in Rust
+  alone would have made the same data forecast differently per server, so it
+  was left for a change to both. **Superseded** by work item MF4: both
+  servers now regress on bucket time (see
+  [ADR 0004](0004-crud-manifest.md), "Forecast"), and the position-based
+  behaviour is gone from this crate.
 - The bulk cap is check-then-act (`count`, then `update_many`/`delete_many`).
   `Repository` has no "write at most N" operation, so the crate cannot make it
   atomic; Python has the same shape. Documented on `crud_actions` and

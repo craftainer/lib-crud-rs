@@ -3,7 +3,7 @@
 //! take part; the handlers that read the data stay in the host.
 //!
 //! [`forecast`] is a plain ordinary-least-squares linear regression over
-//! `(bucket_index, value)` pairs: standard-library arithmetic only, no ML
+//! `(bucket_time, value)` pairs: standard-library arithmetic only, no ML
 //! crate. It is a naive trend projection, not a trained model.
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
@@ -236,15 +236,48 @@ pub struct InsufficientHistory {
     pub have: usize,
 }
 
+/// Whole buckets between two bucket starts (`first` and `value`, both already
+/// truncated by [`bucket_start`]): days for `Day`, days divided by 7 (floor)
+/// for `Week`, calendar months (`12 * year difference + month difference`)
+/// for `Month`.
+fn bucket_offset(first: NaiveDateTime, value: NaiveDateTime, bucket: TimeBucket) -> i64 {
+    if bucket == TimeBucket::Month {
+        return i64::from(value.year() - first.year()) * 12 + i64::from(value.month())
+            - i64::from(first.month());
+    }
+    let days = (value - first).num_days();
+    if bucket == TimeBucket::Week {
+        days.div_euclid(7)
+    } else {
+        days
+    }
+}
+
 /// Project `periods` future buckets via ordinary-least-squares linear
-/// regression. `series` must already be ordered oldest-first.
+/// regression on bucket *time*. `series` must already be ordered
+/// oldest-first.
 ///
-/// The regression is over the position of each point in `series` (0, 1, 2,
-/// ...), not over its `bucket_start`, exactly as `lib-crud-py`'s `forecast`
-/// does, so both servers return the same numbers for the same series. A
-/// series with empty buckets in the middle (a day with no records, which
-/// neither server zero-fills) is therefore treated as if the gap were not
-/// there; a caller that wants the gap to count passes a zero-filled series.
+/// `x_i` is the whole number of buckets between the first bucket's start and
+/// bucket `i`'s start (`Day`: days; `Week`: days / 7, floor; `Month`:
+/// `12 * (year_i - year_0) + (month_i - month_0)`), so an empty bucket leaves
+/// a gap in `x` instead of shifting later points. With `n` points, `y_i` the
+/// bucket value and every sum accumulated left to right in plain `f64`
+/// arithmetic (`+=`; no iterator `sum`, no compensated or pairwise
+/// summation), exactly as `lib-crud-py`'s `forecast` does so both servers
+/// return the same bits for the same series:
+///
+/// ```text
+/// mean_x = (x_0 + ... + x_{n-1}) / n    mean_y = (y_0 + ... + y_{n-1}) / n
+/// sxx = sum (x_i - mean_x)^2            sxy = sum (x_i - mean_x)(y_i - mean_y)
+/// slope = 0.0 if sxx == 0 else sxy / sxx
+/// intercept = mean_y - slope * mean_x
+/// value_k = slope * (x_{n-1} + k) + intercept          for k = 1..=periods
+/// ```
+///
+/// Projected bucket `k` starts `k` whole buckets after the last one. Each
+/// `bucket_start` must already be truncated to its bucket ([`bucket_start`])
+/// and the series strictly ascending, one point per bucket; otherwise two
+/// points share an `x` and the trend is meaningless.
 ///
 /// # Errors
 ///
@@ -259,20 +292,24 @@ pub fn forecast(
     bucket: TimeBucket,
 ) -> Result<Vec<Prediction>, InsufficientHistory> {
     const MINIMUM_BUCKETS: usize = 2;
+    let (Some(first), Some(last)) = (series.first(), series.last()) else {
+        return Err(InsufficientHistory { have: series.len() });
+    };
     if series.len() < MINIMUM_BUCKETS {
         return Err(InsufficientHistory { have: series.len() });
     }
-    let n = series.len();
-    let xs: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let xs: Vec<f64> = series
+        .iter()
+        .map(|point| bucket_offset(first.bucket_start, point.bucket_start, bucket) as f64)
+        .collect();
     let ys: Vec<f64> = series.iter().map(|point| point.value).collect();
     let (slope, intercept) = slope_intercept(&xs, &ys);
-    let last_start = series[n - 1].bucket_start;
+    let last_x = xs[xs.len() - 1];
     let mut predictions = Vec::with_capacity(periods as usize);
     for step in 1..=periods {
-        let x = (n - 1) as f64 + f64::from(step);
-        let value = slope * x + intercept;
+        let value = slope * (last_x + f64::from(step)) + intercept;
         predictions.push(Prediction {
-            bucket_start: advance(last_start, bucket, i64::from(step)),
+            bucket_start: advance(last.bucket_start, bucket, i64::from(step)),
             value,
         });
     }
@@ -280,29 +317,30 @@ pub fn forecast(
 }
 
 /// Ordinary-least-squares slope and intercept for `xs`/`ys` (same length,
-/// non-empty). Guards the zero-variance case (every `x` equal) by
-/// returning a flat `0.0` slope instead of dividing by zero -- `forecast`
-/// itself never produces an all-equal `xs` (it's always `0..n` for
-/// `n >= 2`, whose variance is never zero), but the guard still has to be
-/// correct for any other caller.
+/// non-empty), every sum accumulated left to right (see [`forecast`]).
+/// Guards the zero-variance case (every `x` equal) by returning a flat `0.0`
+/// slope instead of dividing by zero.
 #[expect(
     clippy::cast_precision_loss,
     reason = "series are at most a few hundred buckets; far below f64's 2^52 exact-integer range"
 )]
 fn slope_intercept(xs: &[f64], ys: &[f64]) -> (f64, f64) {
     let n = xs.len() as f64;
-    let mean_x = xs.iter().sum::<f64>() / n;
-    let mean_y = ys.iter().sum::<f64>() / n;
-    let denominator: f64 = xs.iter().map(|x| (x - mean_x).powi(2)).sum();
-    let slope = if denominator == 0.0 {
-        0.0
-    } else {
-        xs.iter()
-            .zip(ys)
-            .map(|(x, y)| (x - mean_x) * (y - mean_y))
-            .sum::<f64>()
-            / denominator
-    };
+    let mut total_x = 0.0;
+    let mut total_y = 0.0;
+    for (x, y) in xs.iter().zip(ys) {
+        total_x += x;
+        total_y += y;
+    }
+    let mean_x = total_x / n;
+    let mean_y = total_y / n;
+    let mut sxx = 0.0;
+    let mut sxy = 0.0;
+    for (x, y) in xs.iter().zip(ys) {
+        sxx += (x - mean_x) * (x - mean_x);
+        sxy += (x - mean_x) * (y - mean_y);
+    }
+    let slope = if sxx == 0.0 { 0.0 } else { sxy / sxx };
     let intercept = mean_y - slope * mean_x;
     (slope, intercept)
 }
@@ -385,20 +423,81 @@ mod tests {
         assert_eq!(predictions[0].bucket_start, dt(2027, 1, 5));
     }
 
+    fn series_on(days: &[i64], values: &[f64]) -> Vec<BucketValue> {
+        days.iter()
+            .zip(values)
+            .map(|(&day, &value)| BucketValue {
+                bucket_start: dt(2027, 1, 1) + Duration::days(day),
+                value,
+            })
+            .collect()
+    }
+
     #[test]
-    fn forecast_regresses_on_series_position_not_on_bucket_time_like_python() {
-        // Values 0, 1, 2 on days 1, 2 and 10: positions 0..3, so the next
-        // point is 3.0, whatever the calendar gap.
-        let series: Vec<BucketValue> = [(1, 0.0), (2, 1.0), (10, 2.0)]
+    fn forecast_regresses_on_bucket_time_so_a_gap_counts() {
+        // Pins the formula shared with lib-crud-py: x = 0, 1, 4, 5 and
+        // y = 3, 1, 7, 4 give mean_x = 2.5, mean_y = 3.75, sxx = 17,
+        // sxy = 11.5, slope = 23/34, intercept = 3.75 - 2.5 * 23/34, so the
+        // value at x = 6 (k = 1) is 104/17.
+        let series = series_on(&[0, 1, 4, 5], &[3.0, 1.0, 7.0, 4.0]);
+        let predictions = forecast(&series, 2, TimeBucket::Day).unwrap();
+        assert!((predictions[0].value - 104.0 / 17.0).abs() < 1e-15);
+        assert_eq!(predictions[0].bucket_start, dt(2027, 1, 7));
+        assert_eq!(predictions[1].bucket_start, dt(2027, 1, 8));
+    }
+
+    #[test]
+    fn forecast_gap_changes_the_trend_versus_position() {
+        // Values 0, 1, 2 on days 1, 2 and 10: x = 0, 1, 9, so the line is
+        // flatter than the position-based 3.0.
+        let series = series_on(&[0, 1, 9], &[0.0, 1.0, 2.0]);
+        let predictions = forecast(&series, 1, TimeBucket::Day).unwrap();
+        assert!((predictions[0].value - 3.0).abs() > 0.5);
+        assert_eq!(predictions[0].bucket_start, dt(2027, 1, 11));
+    }
+
+    #[test]
+    fn bucket_offset_counts_whole_days_weeks_and_months() {
+        let first = dt(2026, 11, 2);
+        assert_eq!(bucket_offset(first, dt(2026, 11, 9), TimeBucket::Day), 7);
+        assert_eq!(bucket_offset(first, dt(2026, 11, 23), TimeBucket::Week), 3);
+        assert_eq!(bucket_offset(first, dt(2026, 11, 29), TimeBucket::Week), 3);
+        assert_eq!(bucket_offset(first, dt(2026, 10, 26), TimeBucket::Week), -1);
+        let first = dt(2026, 11, 1);
+        assert_eq!(bucket_offset(first, dt(2027, 2, 1), TimeBucket::Month), 3);
+        assert_eq!(bucket_offset(first, dt(2028, 1, 1), TimeBucket::Month), 14);
+    }
+
+    #[test]
+    fn forecast_on_weekly_and_monthly_buckets_uses_bucket_units() {
+        // Weekly: weeks 0, 1, 3 -> y = 0, 1, 3: a gap of one week.
+        let weeks: Vec<BucketValue> = [(0, 0.0), (1, 1.0), (3, 3.0)]
             .iter()
-            .map(|&(day, value)| BucketValue {
-                bucket_start: dt(2027, 1, day),
+            .map(|&(week, value)| BucketValue {
+                bucket_start: dt(2027, 1, 4) + Duration::weeks(week),
                 value,
             })
             .collect();
-        let predictions = forecast(&series, 1, TimeBucket::Day).unwrap();
-        assert!((predictions[0].value - 3.0).abs() < 1e-9);
-        assert_eq!(predictions[0].bucket_start, dt(2027, 1, 11));
+        let out = forecast(&weeks, 1, TimeBucket::Week).unwrap();
+        // x = 0, 1, 3: slope = 1, intercept = 4/3 - 4/3 = 0, value at 4 is 4.
+        assert!((out[0].value - 4.0).abs() < 1e-12);
+        assert_eq!(out[0].bucket_start, dt(2027, 2, 1));
+        // Monthly across a year end: months 0, 1, 3 (Nov, Dec, Feb).
+        let months: Vec<BucketValue> = [(2026, 11, 0.0), (2026, 12, 1.0), (2027, 2, 3.0)]
+            .iter()
+            .map(|&(y, m, value)| BucketValue {
+                bucket_start: dt(y, m, 1),
+                value,
+            })
+            .collect();
+        let out = forecast(&months, 1, TimeBucket::Month).unwrap();
+        assert!((out[0].value - 4.0).abs() < 1e-12);
+        assert_eq!(out[0].bucket_start, dt(2027, 3, 1));
+    }
+
+    #[test]
+    fn forecast_of_an_empty_series_is_insufficient() {
+        assert_eq!(forecast(&[], 1, TimeBucket::Day).unwrap_err().have, 0);
     }
 
     #[test]
@@ -415,9 +514,8 @@ mod tests {
 
     #[test]
     fn slope_intercept_returns_a_flat_zero_slope_for_all_equal_xs() {
-        // Degenerate input `forecast` itself never produces (its `xs` is
-        // always `0..n`, whose variance is never zero) -- the guard still
-        // has to return `0.0` rather than `NaN` for any other caller.
+        // Degenerate input `forecast` never produces for distinct bucket
+        // starts -- the guard still has to return `0.0` rather than `NaN`.
         let (slope, intercept) = slope_intercept(&[5.0, 5.0, 5.0], &[1.0, 2.0, 3.0]);
         assert_eq!(slope, 0.0);
         assert!((intercept - 2.0).abs() < 1e-9);

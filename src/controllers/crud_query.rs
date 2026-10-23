@@ -112,7 +112,7 @@ impl FieldSpec {
     }
 }
 
-fn ops_for(kind: FieldKind) -> &'static [&'static str] {
+pub(crate) fn ops_for(kind: FieldKind) -> &'static [&'static str] {
     match kind {
         FieldKind::Number | FieldKind::Float | FieldKind::DateTime => &["eq", "min", "max", "in"],
         FieldKind::String => &["eq", "contains", "icontains"],
