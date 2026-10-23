@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Router;
 use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, VARY};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -97,6 +97,8 @@ async fn get_manifest(
     let validators = [
         (ETAG, etag.as_str()),
         (CACHE_CONTROL, REVALIDATE_CACHE_CONTROL),
+        // The document depends on who is calling, whatever the resolver reads.
+        (VARY, AUTHORIZATION.as_str()),
     ];
     if if_none_match(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, validators).into_response());
@@ -105,7 +107,7 @@ async fn get_manifest(
 }
 
 /// A router serving `GET <prefix>/manifest` (`config.prefix`, by default
-/// `/api/_crud`) for the resources in `registry`, filtered to what
+/// `/api/_crud`; slashes at either end are optional) for the resources in `registry`, filtered to what
 /// `resolver` says the caller may read. The registry is read on every
 /// request, so a resource registered after this call still appears.
 pub fn manifest_router<R: CallerResolver>(
@@ -113,7 +115,12 @@ pub fn manifest_router<R: CallerResolver>(
     config: ManifestConfig,
     resolver: R,
 ) -> Router {
-    let path = format!("{}/manifest", config.prefix.trim_end_matches('/'));
+    let prefix = config.prefix.trim_matches('/');
+    let path = if prefix.is_empty() {
+        "/manifest".to_owned()
+    } else {
+        format!("/{prefix}/manifest")
+    };
     let state = Arc::new(RouteState {
         registry,
         config,

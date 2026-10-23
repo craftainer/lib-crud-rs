@@ -274,7 +274,10 @@ fn bucket_offset(first: NaiveDateTime, value: NaiveDateTime, bucket: TimeBucket)
 /// value_k = slope * (x_{n-1} + k) + intercept          for k = 1..=periods
 /// ```
 ///
-/// Projected bucket `k` starts `k` whole buckets after the last one.
+/// Projected bucket `k` starts `k` whole buckets after the last one. Each
+/// `bucket_start` must already be truncated to its bucket ([`bucket_start`])
+/// and the series strictly ascending, one point per bucket; otherwise two
+/// points share an `x` and the trend is meaningless.
 ///
 /// # Errors
 ///

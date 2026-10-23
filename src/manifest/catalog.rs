@@ -5,7 +5,7 @@
 use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
-use axum::http::header::{CONTENT_TYPE, HOST};
+use axum::http::header::{CONTENT_TYPE, HOST, VARY};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
@@ -49,11 +49,14 @@ struct Catalog {
 /// The base URL the request arrived on: `https` when a proxy says so in
 /// `X-Forwarded-Proto`, else `http`, and the `Host` header (`localhost`
 /// when it is missing or not a plain host). Behind a proxy that does not
-/// forward them, pass an explicit `anchor` instead.
+/// forward them, or where the `Host` header is not trusted, pass an explicit
+/// `anchor` instead (the anchor is reflected from the request otherwise).
 fn request_base(headers: &HeaderMap) -> String {
     let https = headers
         .get("x-forwarded-proto")
-        .is_some_and(|proto| proto.as_bytes() == b"https");
+        .and_then(|proto| proto.to_str().ok())
+        .and_then(|proto| proto.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"));
     let host = headers
         .get(HOST)
         .and_then(|host| host.to_str().ok())
@@ -93,7 +96,16 @@ async fn get_catalog(State(catalog): State<Arc<Catalog>>, headers: HeaderMap) ->
         }],
     };
     let body = serde_json::to_vec(&linkset).expect("a linkset always serializes");
-    ([(CONTENT_TYPE, LINKSET_MEDIA_TYPE)], body).into_response()
+    // A derived anchor depends on the request's headers, so a shared cache
+    // must not serve one client's anchor to another.
+    (
+        [
+            (CONTENT_TYPE, LINKSET_MEDIA_TYPE),
+            (VARY, "Host, X-Forwarded-Proto"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// A router serving `GET /.well-known/api-catalog`; merge it into the app

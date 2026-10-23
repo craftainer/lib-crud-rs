@@ -290,6 +290,11 @@ async fn route_honours_prefix_and_sees_later_registrations() {
         get(&router, "/api/_crud/manifest", &[]).await.0,
         StatusCode::NOT_FOUND
     );
+    assert_eq!(headers[axum::http::header::VARY], "authorization");
+    for (prefix, path) in [("", "/manifest"), ("api", "/api/manifest")] {
+        let router = router_for(&registry, prefix);
+        assert_eq!(get(&router, path, &[]).await.0, StatusCode::OK, "{prefix}");
+    }
 }
 
 #[tokio::test]
@@ -398,6 +403,10 @@ async fn api_catalog_anchor_defaults_to_the_request_base() {
         ])
         .await,
         "https://api.example.com:8443"
+    );
+    assert_eq!(
+        anchor(&[("host", "h"), ("x-forwarded-proto", "HTTPS, http")]).await,
+        "https://h"
     );
     assert_eq!(anchor(&[("host", "a.b/evil\"")]).await, "http://localhost");
     assert_eq!(anchor(&[]).await, "http://localhost");
