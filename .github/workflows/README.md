@@ -23,11 +23,16 @@
   Makefile contract"): `make release-arches` picks the arch matrix;
   `build`/`sbom`/`release-assets`/`publish` run once per arch, natively
   (no QEMU — see "Architecture matrix" below), each leg uploading its
-  `dist/` as `release-assets-<arch>`; `publish-packages` then runs once,
-  but only for an instance that sets `PYPI_PUBLISH`, `NPM_PUBLISH` or
-  `CARGO_PUBLISH`; then one job downloads the `dist/`s,
-  runs `make release-check` inside the devcontainer and `make finalize`
-  on the host, and creates a GitHub release with everything in `dist/`.
+  `dist/` as `release-assets-<arch>`; the `release-check` job then assembles
+  the `dist/`s (failing on a missing arch or a duplicate file name) and
+  runs `make release-check` inside the devcontainer, gating the GitHub
+  release and package publishing (not the per-arch image `publish`, which
+  already ran in `build`); the `release` job runs `make finalize` and
+  creates the GitHub release with everything in `dist/`; only then do
+  `publish-packages` and
+  `verify-published` run, and only for an instance that sets
+  `PYPI_PUBLISH`, `NPM_PUBLISH` or `CARGO_PUBLISH`. A partial registry
+  failure therefore never withholds the release.
 - `moderate-bug-triage.yml` / `moderate-bug-fix.yml` /
   `moderate-bug-fix-apply.yml` / `moderate-feature-triage.yml` /
   `moderate-feature-build.yml` / `moderate-feature-build-apply.yml` /
@@ -60,7 +65,7 @@ Each matrix leg can be overridden independently with
 label) — e.g. to point either arch at a self-hosted runner instead of
 GitHub's. This is separate from the plain `CI_RUNNER` variable, which
 still overrides the single-runner jobs (`perf.yml`, `template-sync.yml`,
-and `release.yml`'s `version`/`manifest`/`release` jobs) that aren't
+and `release.yml`'s `version`/`release-check`/`release`/`publish-packages`/`verify-published` jobs) that aren't
 matrixed by arch.
 
 The devcontainer used for local development (`.devcontainer/Dockerfile`'s `develop`
@@ -286,8 +291,9 @@ cleanly when the registry isn't configured.
 - `NPM_PUBLISH` / `CARGO_PUBLISH` (variables, optional) — non-empty makes
   `make publish-packages` push to npm / crates.io; unset skips it. Setting
   any of the three is what creates the `publish-packages` job at all.
-  They are passed to that job and, like `PYPI_PUBLISH`, forwarded to
-  `release-check` so it can install what was published.
+  They are passed to that job and to `verify-published`, which is where
+  an instance checks what was published (`release-check` runs before
+  publishing and does not receive them).
 - `NPM_TOKEN` / `CARGO_REGISTRY_TOKEN` (secrets, optional) — bootstrap
   tokens for the first release of a package, before trusted publishing
   is configured. Exposed only on the `make publish-packages` step's

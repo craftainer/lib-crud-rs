@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import stat
@@ -32,7 +33,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from template_sync_manifest import classify, parse_manifest
+from template_sync_manifest import classify, matches, parse_manifest
 
 TAG_RE = re.compile(
     r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
@@ -142,10 +143,35 @@ def relative_files_under(root: Path, rel_dir: str) -> list[str]:
     return [p.relative_to(root).as_posix() for p in base.rglob("*") if p.is_file()]
 
 
+def relative_files_matching(root: Path, pattern: str) -> list[str]:
+    """Return every regular file under ``root`` matching the glob ``pattern``.
+
+    Uses the manifest's own ``matches`` (``*`` spans ``/``), so what sync
+    expands is exactly what the completeness check classifies. ``.git`` is
+    skipped. A pattern that matches nothing yields an empty list.
+    """
+    if not root.is_dir():
+        return []
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if ".git" in dirnames:
+            dirnames.remove(".git")  # don't descend into git metadata
+        for name in filenames:
+            rel = (Path(dirpath) / name).relative_to(root).as_posix()
+            if (Path(dirpath) / name).is_file() and matches(rel, pattern):
+                found.append(rel)
+    return found
+
+
 def tier_paths(root: Path, tiers: dict[str, list[str]], tier: str) -> set[str]:
     """Return every file under ``root`` classified into ``tier`` by the manifest."""
     candidates: set[str] = set()
     for pattern in tiers[tier]:
+        # Same glob test as template_sync_manifest.matches: only "*"/"?" make
+        # a pattern a glob; "[...]" counts only alongside one of them.
+        if "*" in pattern or "?" in pattern:
+            candidates.update(relative_files_matching(root, pattern))
+            continue
         rel = pattern.rstrip("/") if pattern.endswith("/") else pattern
         candidates.update(relative_files_under(root, rel))
     return {path for path in candidates if classify(path, tiers) == [tier]}
@@ -158,6 +184,8 @@ def is_executable(path: Path) -> bool:
 
 def sync_executable_bit(src: Path, dst: Path) -> None:
     """Make ``dst``'s execute bits match ``src``'s, leaving its other bits alone."""
+    if dst.is_symlink():
+        return  # chmod would follow the link and change its target, not the link.
     mode = dst.stat().st_mode
     exec_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
     if is_executable(src):
@@ -178,6 +206,8 @@ def apply_replace(
     for path in sorted(new_paths):
         src = new_root / path
         dst = instance_root / path
+        if dst.is_symlink():
+            continue  # the instance deliberately links it; writing would follow the link.
         dst.parent.mkdir(parents=True, exist_ok=True)
         if not dst.exists() or dst.read_bytes() != src.read_bytes():
             shutil.copy2(src, dst)
@@ -210,7 +240,12 @@ def merge_file(instance_file: Path, base_file: Path, theirs_file: Path) -> bool:
 def apply_merge(
     old_root: Path, new_root: Path, instance_root: Path, paths: set[str]
 ) -> dict[str, list[str]]:
-    """3-way-merge merge-tier paths; return {"merged": [...], "conflicts": [...]}."""
+    """3-way-merge merge-tier paths; return {"merged": [...], "conflicts": [...]}.
+
+    ``merged`` lists only files whose content actually changed, so running the
+    same step again (an instance already at the new version) reports nothing.
+    A path the instance links elsewhere is left alone, as in the replace tier.
+    """
     merged: list[str] = []
     conflicts: list[str] = []
     for path in sorted(paths):
@@ -219,6 +254,8 @@ def apply_merge(
         instance_file = instance_root / path
         if not new_file.exists():
             continue  # removed upstream: a merge-tier file is never deleted automatically.
+        if instance_file.is_symlink():
+            continue  # the instance deliberately links it; merging would write through the link.
         if not instance_file.exists():
             instance_file.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(new_file, instance_file)
@@ -227,6 +264,7 @@ def apply_merge(
         base_content = old_file.read_bytes() if old_file.exists() else b""
         if new_file.read_bytes() == base_content:
             continue  # unchanged upstream since the last sync
+        before = instance_file.read_bytes()
         if old_file.exists():
             conflicted = merge_file(instance_file, old_file, new_file)
         else:
@@ -234,7 +272,10 @@ def apply_merge(
             # version to use as a base, so merge against an empty one.
             with tempfile.NamedTemporaryFile() as empty_base:
                 conflicted = merge_file(instance_file, Path(empty_base.name), new_file)
-        (conflicts if conflicted else merged).append(path)
+        if conflicted:
+            conflicts.append(path)
+        elif instance_file.read_bytes() != before:
+            merged.append(path)
     return {"merged": merged, "conflicts": conflicts}
 
 
