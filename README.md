@@ -51,6 +51,16 @@ lists where and why. Things a host needs to know:
   every instance (and across restarts) if clients should resume. Delivery
   covers events that reached the broker; a publish can still be dropped before
   that (see `events`).
+- `EventBus::subscribe_transient` connects with a clean session, so the broker
+  drops the session when the connection ends (cleanly or by crash) and a
+  restarting in-process consumer (a cache invalidator) orphans nothing; it is
+  never replayed to. `subscribe` stays durable, and the HTTP events route only
+  uses `subscribe`. Use `None` for the id: a clean-session connect under an id a
+  durable subscriber uses discards that subscriber's session. Production
+  brokers should also set a finite persistent-session expiry, sized to the
+  longest SSE replay window clients need (Mosquitto's
+  `persistent_client_expiration 1h`; Mosquitto never expires by default, EMQX
+  defaults to 2h).
 - The forecast regresses on bucket time (a gap in the series counts), the
   same formula as `lib-crud-py`.
 - The manifest is built from what the host registers; see

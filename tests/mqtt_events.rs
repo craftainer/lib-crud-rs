@@ -10,6 +10,7 @@
 //! - a QoS-1 publish reaches a live subscriber;
 //! - an event published while a subscriber is *disconnected* is delivered
 //!   when the same `subscriber_id` reconnects (the persistent session);
+//! - a *transient* subscriber (clean session) leaves nothing to replay;
 //! - reconnecting with a *different* id gets no replay, which is the
 //!   guarantee's stated limit rather than a bug.
 //!
@@ -94,6 +95,41 @@ async fn a_published_event_reaches_a_live_subscriber() {
     assert_eq!(event.resource, resource);
     assert_eq!(event.action, EventAction::Create);
     assert_eq!(event.ids, vec![42]);
+}
+
+#[tokio::test]
+async fn a_transient_subscriber_leaves_no_session_to_replay() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker();
+
+    let (subscriber_id, mut first) = bus.subscribe_transient(&resource, None).await.unwrap();
+    settle(&mut first).await;
+    bus.publish(CrudEvent::new(&resource, EventAction::Create, vec![1]))
+        .await;
+    assert!(
+        next_within(&mut first, RECEIVE_TIMEOUT).await.is_some(),
+        "a transient subscriber still receives events while connected"
+    );
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    bus.publish(CrudEvent::new(&resource, EventAction::Update, vec![2]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Resuming the same client id durably finds no session, so nothing was
+    // queued for it while it was away.
+    let (resumed_id, mut second) = bus
+        .subscribe(&resource, Some(&subscriber_id))
+        .await
+        .unwrap();
+    assert_eq!(resumed_id, subscriber_id);
+    assert!(
+        next_within(&mut second, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "the broker must hold no session for a transient subscriber"
+    );
 }
 
 #[tokio::test]

@@ -26,9 +26,9 @@
 //! covers the resource and the MQTT client id is
 //! `crud-events-<resource>-<id>`.
 //!
-//! Every connection that has to be given a fresh id is *anonymous* and
-//! leaves a persistent session on the broker behind it. The number of
-//! anonymous streams open at once is capped
+//! Every connection that has to be given a fresh id is *anonymous*. With
+//! [`EventBus::subscribe`] it also leaves a persistent session on the broker
+//! behind it. The number of anonymous streams open at once is capped
 //! ([`EventBus::with_max_anonymous_connections`]): over the cap
 //! [`EventBus::subscribe`] fails with
 //! [`EventError::TooManyAnonymousConnections`], so unauthenticated callers
@@ -44,11 +44,28 @@
 //! id (on MQTT they share a client id, so the broker keeps replacing the older
 //! connection); that too is the host's to rate-limit.
 //!
+//! ## Transient subscribers
+//!
+//! A long-lived in-process consumer that always starts from scratch (a cache
+//! invalidator) has no use for replay, and every restart would otherwise
+//! orphan its previous persistent session. [`EventBus::subscribe_transient`]
+//! connects with a *clean* session instead (MQTT 3.1.1 section 3.1.2.4): the
+//! broker discards the session when the connection ends, whether it closes
+//! cleanly or crashes, so nothing is left behind and nothing is replayed.
+//! Pass `None` for the id (a fresh one is minted); an id a durable subscriber
+//! uses would have its stored session discarded by the clean-session connect.
+//! The HTTP events route never uses it, because browser clients rely on
+//! replay. Production brokers should also set a finite persistent-session
+//! expiry sized to the longest replay window clients need (Mosquitto's
+//! `persistent_client_expiration`, never by default; EMQX defaults to 2h), as
+//! a backstop for abandoned durable sessions.
+//!
 //! ## Delivery guarantee (MQTT bus, and its exact scope)
 //!
 //! A subscriber is issued a `subscriber_id` on first connect. That id, and
 //! nothing else, is what the guarantee hangs on: it becomes part of the MQTT
-//! **client id** of a **persistent session** (`set_clean_session(false)`)
+//! **client id** of a **persistent session** (`set_clean_session(false)`; see
+//! [`EventBus::subscribe_transient`] for the clean-session alternative)
 //! subscribed at **`QoS` 1** to `crud-events/<resource>`. Because the session
 //! is persistent, the broker queues messages published while that client id
 //! is disconnected and delivers them when the same client id reconnects.
@@ -600,6 +617,35 @@ impl EventBus {
     /// [`EventError::Broker`] when the broker is unreachable or refuses the
     /// session or subscription; [`EventError::TooManyAnonymousConnections`]
     /// when a fresh id is needed and the cap is reached.
+    pub async fn subscribe(
+        &self,
+        resource: &str,
+        requested: Option<&str>,
+    ) -> Result<(String, EventStream), EventError> {
+        self.open(resource, requested, true).await
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but *transient*: on the MQTT path
+    /// the connection uses a clean session, so the broker drops the session
+    /// when the connection ends (cleanly or by crash) and a restarting
+    /// consumer orphans nothing. Nothing queued while it is away is
+    /// replayed. On the mock bus it behaves like [`subscribe`](Self::subscribe).
+    ///
+    /// Pass `None` for `requested` unless the id belongs to a transient
+    /// subscriber: a clean-session connect under an id a durable subscriber
+    /// uses discards that subscriber's stored session.
+    ///
+    /// # Errors
+    ///
+    /// As [`subscribe`](Self::subscribe).
+    pub async fn subscribe_transient(
+        &self,
+        resource: &str,
+        requested: Option<&str>,
+    ) -> Result<(String, EventStream), EventError> {
+        self.open(resource, requested, false).await
+    }
+
     #[cfg_attr(
         not(feature = "mqtt"),
         expect(
@@ -608,11 +654,14 @@ impl EventBus {
             reason = "the signature is the same with and without the `mqtt` feature"
         )
     )]
-    pub async fn subscribe(
+    async fn open(
         &self,
         resource: &str,
         requested: Option<&str>,
+        durable: bool,
     ) -> Result<(String, EventStream), EventError> {
+        #[cfg(not(feature = "mqtt"))]
+        let _ = durable;
         let (subscriber_id, permit) =
             match requested.and_then(|raw| self.verify_subscriber_id(resource, raw)) {
                 Some(resumed) => (resumed, None),
@@ -624,7 +673,7 @@ impl EventBus {
         let inner = match &self.backend {
             #[cfg(feature = "mqtt")]
             Backend::Mqtt { host, port, .. } => {
-                open_mqtt(host, *port, resource, &subscriber_id).await?
+                open_mqtt(host, *port, resource, &subscriber_id, durable).await?
             }
             Backend::Mock(sender) => Inner::Mock {
                 receiver: sender.subscribe(),
@@ -641,29 +690,32 @@ impl EventBus {
     }
 }
 
-/// Open one subscriber's persistent MQTT session and wait for the broker to
-/// accept it and the subscription.
+/// Open one subscriber's MQTT session (persistent when `durable`) and wait
+/// for the broker to accept it and the subscription.
 #[cfg(feature = "mqtt")]
 async fn open_mqtt(
     host: &str,
     port: u16,
     resource: &str,
     subscriber_id: &str,
+    durable: bool,
 ) -> Result<Inner, EventError> {
     let mut options = MqttOptions::new(client_id_for(resource, subscriber_id), host, port);
     options.set_keep_alive(KEEP_ALIVE);
     // The entire delivery guarantee: a persistent session keyed by this
     // subscriber's own client id. The client id is never empty (it always
     // carries the minted id), which is what keeps this call (which panics
-    // on an empty client id) safe.
-    options.set_clean_session(false);
+    // on an empty client id) safe. A transient subscriber asks for a clean
+    // session instead, which the broker discards when the connection ends.
+    options.set_clean_session(!durable);
     let (client, mut eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
     subscribe_to(&client, topic(resource)).await?;
     let backlog = await_subscription(&mut eventloop, SUBSCRIBE_TIMEOUT).await?;
     Ok(Inner::Mqtt {
         // Kept alive alongside the event loop: dropping the client closes
         // the request channel and ends the loop.
-        _client: client,
+        client,
+        topic: topic(resource),
         eventloop: Box::new(eventloop),
         errors: ErrorRun::default(),
         backlog,
@@ -682,7 +734,10 @@ pub struct EventStream {
 enum Inner {
     #[cfg(feature = "mqtt")]
     Mqtt {
-        _client: AsyncClient,
+        client: AsyncClient,
+        /// Subscribed again whenever the broker reports a reconnect without
+        /// the session (a clean-session stream never has one to resume).
+        topic: String,
         eventloop: Box<dyn MqttPoll>,
         errors: ErrorRun,
         /// Events decoded while the subscription was being set up.
@@ -726,17 +781,24 @@ impl EventStream {
     /// The next event, or `None` once the feed is finished (the broker kept
     /// failing for `MAX_CONSECUTIVE_POLL_ERRORS` attempts without a
     /// `HEALTHY_AFTER` stretch of quiet in between, or -- under the
-    /// in-memory bus -- the bus itself was dropped). Ending the stream is
-    /// safe: the client reconnects with the same `subscriber_id` and resumes
-    /// the same persistent session.
+    /// in-memory bus -- the bus itself was dropped). After a durable
+    /// [`subscribe`](EventBus::subscribe) stream ends, the client reconnects
+    /// with the same `subscriber_id` and resumes the same persistent session;
+    /// a transient stream has no session to resume, so its owner just
+    /// subscribes again.
+    ///
+    /// When the broker reconnects without a session, the stream subscribes
+    /// again by itself (and ends if it cannot); events published during the
+    /// outage are lost.
     pub async fn next_event(&mut self) -> Option<CrudEvent> {
         match &mut self.inner {
             #[cfg(feature = "mqtt")]
             Inner::Mqtt {
+                client,
+                topic,
                 eventloop,
                 errors,
                 backlog,
-                ..
             } => {
                 if let Some(event) = backlog.pop_front() {
                     return Some(event);
@@ -747,6 +809,20 @@ impl EventStream {
                             errors.succeeded();
                             if let Some(event) = decode_event(&publish.payload) {
                                 return Some(event);
+                            }
+                        }
+                        // A reconnect the broker has no session for (a
+                        // transient stream, or a durable session that
+                        // expired) lost the subscription with it, so ask for
+                        // it again or the stream would stay quiet for good.
+                        Ok(Event::Incoming(Packet::ConnAck(ack))) if !ack.session_present => {
+                            errors.succeeded();
+                            if let Err(err) = client.try_subscribe(topic.clone(), QoS::AtLeastOnce)
+                            {
+                                // Without the subscription the stream would stay
+                                // quiet for good; ending it tells the owner.
+                                tracing::warn!("mqtt resubscribe failed: {err}");
+                                return None;
                             }
                         }
                         // ConnAck/SubAck/PingResp/outgoing acks -- the
@@ -1026,7 +1102,8 @@ mod tests {
         let (client, _real_eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
         EventStream {
             inner: Inner::Mqtt {
-                _client: client,
+                client,
+                topic: topic("widgets"),
                 eventloop: Box::new(ScriptedEventLoop::new(responses)),
                 errors: ErrorRun::default(),
                 backlog: VecDeque::new(),
@@ -1226,9 +1303,14 @@ mod tests {
 
     #[cfg(feature = "mqtt")]
     fn conn_ack() -> Event {
+        conn_ack_with(false)
+    }
+
+    #[cfg(feature = "mqtt")]
+    fn conn_ack_with(session_present: bool) -> Event {
         Event::Incoming(Packet::ConnAck(rumqttc::ConnAck::new(
             rumqttc::ConnectReturnCode::Success,
-            false,
+            session_present,
         )))
     }
 
@@ -1265,7 +1347,8 @@ mod tests {
         let (client, _real) = AsyncClient::new(MqttOptions::new("t", "localhost", 1883), 1);
         let mut stream = EventStream {
             inner: Inner::Mqtt {
-                _client: client,
+                client,
+                topic: topic("widgets"),
                 eventloop: Box::new(SlowEventLoop(script)),
                 errors: ErrorRun::default(),
                 backlog: VecDeque::new(),
@@ -1283,7 +1366,8 @@ mod tests {
         let (client, _real) = AsyncClient::new(MqttOptions::new("t", "localhost", 1883), 1);
         let mut stream = EventStream {
             inner: Inner::Mqtt {
-                _client: client,
+                client,
+                topic: topic("widgets"),
                 eventloop: Box::new(ScriptedEventLoop::new(vec![Ok(publish_event(&live))])),
                 errors: ErrorRun::default(),
                 backlog: VecDeque::from([buffered]),
@@ -1310,6 +1394,48 @@ mod tests {
         let other = bus.mint_subscriber_id("gadgets");
         let (fresh, _stream) = bus.subscribe("widgets", Some(&other)).await.unwrap();
         assert_ne!(fresh, other);
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_reconnect_without_a_session_subscribes_again_and_keeps_streaming() {
+        let event = CrudEvent::new("widgets", EventAction::Create, vec![4]);
+        let script = || {
+            vec![
+                Ok(conn_ack_with(true)),
+                Ok(conn_ack_with(false)),
+                Ok(publish_event(&event)),
+            ]
+        };
+
+        // Request queue open: the resubscribe is queued.
+        let options = MqttOptions::new("test-client", "localhost", 1883);
+        let (client, _requests) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        let mut stream = EventStream {
+            inner: Inner::Mqtt {
+                client,
+                topic: topic("widgets"),
+                eventloop: Box::new(ScriptedEventLoop::new(script())),
+                errors: ErrorRun::default(),
+                backlog: VecDeque::new(),
+            },
+            _permit: None,
+        };
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![4]);
+
+        // Request queue closed: the failed resubscribe ends the stream.
+        let mut stream = mqtt_stream_with(script());
+        assert!(stream.next_event().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_transient_mock_subscriber_receives_events_like_a_durable_one() {
+        let bus = EventBus::mock();
+        let (id, mut stream) = bus.subscribe_transient("widgets", None).await.unwrap();
+        assert!(bus.verify_subscriber_id("widgets", &id).is_some());
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![3]))
+            .await;
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![3]);
     }
 
     #[tokio::test]
