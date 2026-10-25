@@ -78,7 +78,7 @@ Decision so the next reader knows which way each was resolved and why.
   or a bulk target into the wrong set. `Number` keeps meaning integer. Float
   fields take part in stats and predict like integers.
 - `RESERVED_PARAMS` is public and complete per the manifest:
-  `skip`, `limit`, `sort`, `id`, `include_archived`, `include_unpublished`.
+  `skip`, `limit`, `sort`, `id`, `include_archived`, `include_unpublished` (and `only_archived`, see ADR 0006).
 - Categorical counts come back fields-in-order, values in first-seen order
   (Python's in-memory repository), instead of hash order.
 

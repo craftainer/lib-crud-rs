@@ -9,7 +9,7 @@ resource's own router composes. There is no router and no axum `State` here.
   `R: Repository`.
 - `crud_query.rs` — query string to `FilterClause`/`SortClause`, driven by a
   resource's own `FieldSpec` table, plus the `include_archived` /
-  `only_archived` flag parsers (`parse_include_archived`,
+  `only_archived` flag parsers (`parse_archived_scope`, `parse_include_archived`,
   `parse_only_archived`, `reject_only_archived`) a host calls on the raw query.
 - `crud_stats.rs` — the resource-agnostic parts of `/stats` and `/predict`:
   `TimeBucket`, field-kind narrowing, the OLS `forecast` (regressed on

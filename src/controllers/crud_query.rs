@@ -26,6 +26,7 @@
 
 use chrono::{NaiveDateTime, Utc};
 
+use crate::controllers::crud_actions::ArchivedScope;
 use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
 use crate::views::FieldError;
 
@@ -243,6 +244,20 @@ pub fn parse_include_archived<K: AsRef<str>, V: AsRef<str>>(
 ) -> Result<bool, Vec<FieldError>> {
     parse_only_archived(params)?;
     Ok(parse_flag(params, "include_archived")?.unwrap_or(false))
+}
+
+/// The [`ArchivedScope`] a list read selects: the one call a host makes for
+/// `include_archived` and `only_archived` together.
+///
+/// # Errors
+///
+/// As [`parse_include_archived`].
+pub fn parse_archived_scope<K: AsRef<str>, V: AsRef<str>>(
+    params: &[(K, V)],
+) -> Result<ArchivedScope, Vec<FieldError>> {
+    let include_archived = parse_include_archived(params)?;
+    let only_archived = parse_only_archived(params)?;
+    Ok(ArchivedScope::from_flags(include_archived, only_archived))
 }
 
 /// Refuse `?only_archived=true` on a route that cannot honour it: only a list
@@ -764,6 +779,18 @@ mod tests {
             errors[0].msg,
             "cannot be combined with include_archived=false"
         );
+    }
+
+    #[test]
+    fn parse_archived_scope_combines_both_flags() {
+        let scope = |pairs: &[(&str, &str)]| parse_archived_scope(&params(pairs)).unwrap();
+        assert_eq!(scope(&[]), ArchivedScope::Live);
+        assert_eq!(
+            scope(&[("include_archived", "true")]),
+            ArchivedScope::Include
+        );
+        assert_eq!(scope(&[("only_archived", "true")]), ArchivedScope::Only);
+        assert!(parse_archived_scope(&params(&[("only_archived", "x")])).is_err());
     }
 
     #[test]

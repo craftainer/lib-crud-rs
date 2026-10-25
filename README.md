@@ -47,8 +47,7 @@ lists where and why. Things a host needs to know:
 - The bulk cap is a check followed by a write, not one atomic step.
 - `only_archived=true` (a reserved key, see
   [ADR 0006](docs/adrs/0006-only-archived-list-param.md)) narrows a list to the
-  archived rows. Call `parse_include_archived` / `parse_only_archived` on the
-  raw query for list reads and `reject_only_archived` for writes, restore and
+  archived rows. Call `parse_archived_scope` on the raw query for list reads and `reject_only_archived` for writes, restore and
   `/stats`; a `Repository` implements `ListOptions::only_archived` and the
   `only_archived` argument of `count`.
 - Event streams use server-minted, per-resource subscriber ids, cap the

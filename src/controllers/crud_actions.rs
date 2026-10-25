@@ -134,7 +134,7 @@ where
         return Err(no_target_error());
     }
     let matched = crud
-        .count(&owner_scoped(owner_id, filters.to_vec()), false, false)
+        .count(&owner_scoped(owner_id, filters.to_vec()), false, false) // live rows only: bulk writes never touch archived ones
         .await?;
     if matched > max_matched {
         return Err(too_many_matched_error(matched, max_matched));

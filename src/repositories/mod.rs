@@ -101,8 +101,9 @@ pub trait Repository: Send + Sync {
 
     /// How many non-archived (unless `include_archived`) rows match
     /// `filters`, or only the archived ones when `only_archived` (which takes
-    /// precedence over `include_archived`); used to cap a bulk update/delete before it runs. `filters`
-    /// carry the `owner_id` clause described on [`Repository`].
+    /// precedence over `include_archived`); used to cap a bulk update/delete
+    /// before it runs. `filters` carry the `owner_id` clause described on
+    /// [`Repository`].
     ///
     /// # Errors
     ///

@@ -54,8 +54,8 @@ where
     }
 
     /// How many non-archived (unless `include_archived`) records match
-    /// `filters`, or only the archived ones when `only_archived`; callers use this to cap a bulk update/delete before it
-    /// runs.
+    /// `filters`, or only the archived ones when `only_archived`; callers use
+    /// this to cap a bulk update/delete before it runs.
     ///
     /// # Errors
     ///
