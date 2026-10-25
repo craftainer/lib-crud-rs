@@ -10,7 +10,8 @@ a dependent would, and runs against the devcontainer's backing services.
 - `mqtt_events.rs` — the event bus against a real Mosquitto
   (`MQTT_HOST`/`MQTT_PORT`). Needs the `mqtt` feature (`required-features`
   in `Cargo.toml`). It is the only place the persistent-session delivery
-  guarantee can be verified.
+  guarantee can be verified, including the MQTT 5.0 session TTL (replay within
+  it, session gone after it, unset unchanged, transient unaffected).
 - `manifest_conformance.rs` — the CRUD manifest conformance fixtures through
   the builder and the route, validated against the I1 JSON Schema. Needs no
   backing service.
