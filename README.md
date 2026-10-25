@@ -66,6 +66,16 @@ lists where and why. Things a host needs to know:
   longest SSE replay window clients need (Mosquitto's
   `persistent_client_expiration 1h`; Mosquitto never expires by default, EMQX
   defaults to 2h).
+- `EventBus::with_session_ttl` bounds abandoned durable sessions on the client
+  side: durable subscribers then connect over MQTT 5.0 with Clean Start off and
+  a Session Expiry Interval of that many seconds (1 to 4294967295), so a browser
+  SSE client that never returns has its session and queued events dropped by the
+  broker after the TTL. Within the TTL a returning id is replayed as before.
+  Unset keeps MQTT 3.1.1. Transient subscribers and the publisher stay on 3.1.1,
+  and the two versions interoperate on the same topic. The broker must speak
+  MQTT 5.0 and may cap the value (Mosquitto `max_session_expiry_interval`); the
+  broker-side expiry above stays advisable as a backstop. See
+  [ADR 0007](docs/adrs/0007-durable-session-ttl.md).
 - The forecast regresses on bucket time (a gap in the series counts), the
   same formula as `lib-crud-py`.
 - The manifest is built from what the host registers; see

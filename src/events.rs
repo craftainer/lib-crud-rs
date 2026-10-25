@@ -60,6 +60,19 @@
 //! `persistent_client_expiration`, never by default; EMQX defaults to 2h), as
 //! a backstop for abandoned durable sessions.
 //!
+//! ## Bounding abandoned durable sessions
+//!
+//! [`EventBus::with_session_ttl`] makes durable subscribers connect over MQTT
+//! 5.0 with Clean Start off and a Session Expiry Interval of that many seconds
+//! (MQTT 5.0 sections 3.1.2.4 and 3.1.2.11.2), so a browser SSE client that
+//! never returns has its session and queued events dropped by the broker after
+//! the TTL, with no broker-wide setting needed. Within the TTL a returning id
+//! is replayed as before. Unset (the default) keeps MQTT 3.1.1 and leaves
+//! expiry to the broker. Transient subscribers and the publisher stay on
+//! 3.1.1; the broker delivers between the two versions. The broker must speak
+//! MQTT 5.0 and may cap the value (Mosquitto's `max_session_expiry_interval`).
+//! See `docs/adrs/0007-durable-session-ttl.md`.
+//!
 //! ## Delivery guarantee (MQTT bus, and its exact scope)
 //!
 //! A subscriber is issued a `subscriber_id` on first connect. That id, and
@@ -93,34 +106,137 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 #[cfg(feature = "mqtt")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hmac::{Hmac, KeyInit, Mac};
 #[cfg(feature = "mqtt")]
 use rumqttc::{
     AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS, SubscribeReasonCode,
+    v5 as mqtt5,
 };
 use sha2::Sha256;
 use tokio::sync::broadcast;
 
+/// What an event loop's poll produced, reduced to what this module acts on,
+/// so one stream type serves both MQTT 3.1.1 and MQTT 5.0 connections.
 #[cfg(feature = "mqtt")]
-/// Abstraction over `rumqttc::EventLoop::poll`, so an MQTT `EventStream`
-/// can be driven by a test-only fake that returns a scripted sequence of
-/// poll errors -- the only way to deterministically exercise
+#[derive(Debug)]
+enum Polled {
+    /// An incoming PUBLISH, with its payload.
+    Publish(Vec<u8>),
+    /// A CONNACK: whether the broker resumed a stored session.
+    ConnAck { session_present: bool },
+    /// A SUBACK: whether any requested subscription was refused.
+    SubAck { refused: bool },
+    /// Anything else -- the protocol turning over.
+    Other,
+}
+
+/// Reduce an MQTT 3.1.1 poll result to a [`Polled`].
+#[cfg(feature = "mqtt")]
+fn polled_v3(result: Result<Event, ConnectionError>) -> Result<Polled, String> {
+    Ok(match result.map_err(|err| err.to_string())? {
+        Event::Incoming(Packet::Publish(publish)) => Polled::Publish(publish.payload.to_vec()),
+        Event::Incoming(Packet::ConnAck(ack)) => Polled::ConnAck {
+            session_present: ack.session_present,
+        },
+        Event::Incoming(Packet::SubAck(ack)) => Polled::SubAck {
+            refused: ack
+                .return_codes
+                .iter()
+                .any(|code| matches!(code, SubscribeReasonCode::Failure)),
+        },
+        _ => Polled::Other,
+    })
+}
+
+/// Reduce an MQTT 5.0 poll result to a [`Polled`]. Any SUBACK reason other
+/// than a granted `QoS` is a refusal.
+#[cfg(feature = "mqtt")]
+fn polled_v5(result: Result<mqtt5::Event, mqtt5::ConnectionError>) -> Result<Polled, String> {
+    use mqtt5::mqttbytes::v5::{Packet as Packet5, SubscribeReasonCode as Reason5};
+    Ok(match result.map_err(|err| err.to_string())? {
+        mqtt5::Event::Incoming(Packet5::Publish(publish)) => {
+            Polled::Publish(publish.payload.to_vec())
+        }
+        mqtt5::Event::Incoming(Packet5::ConnAck(ack)) => Polled::ConnAck {
+            session_present: ack.session_present,
+        },
+        mqtt5::Event::Incoming(Packet5::SubAck(ack)) => Polled::SubAck {
+            refused: ack
+                .return_codes
+                .iter()
+                .any(|code| !matches!(code, Reason5::Success(_))),
+        },
+        _ => Polled::Other,
+    })
+}
+
+#[cfg(feature = "mqtt")]
+/// Abstraction over `rumqttc::EventLoop::poll` (3.1.1 or 5.0), so an MQTT
+/// `EventStream` can be driven by a test-only fake that returns a scripted
+/// sequence of poll errors -- the only way to deterministically exercise
 /// `next_event`'s backoff/reconnect-limit branches without actually
 /// breaking the shared Mosquitto container mid-suite, which would risk
 /// flaking every other MQTT test running concurrently.
 #[async_trait::async_trait]
 trait MqttPoll: Send {
-    async fn poll(&mut self) -> Result<Event, ConnectionError>;
+    async fn poll(&mut self) -> Result<Polled, String>;
 }
 
 #[cfg(feature = "mqtt")]
 #[async_trait::async_trait]
 impl MqttPoll for EventLoop {
-    async fn poll(&mut self) -> Result<Event, ConnectionError> {
-        EventLoop::poll(self).await
+    async fn poll(&mut self) -> Result<Polled, String> {
+        polled_v3(EventLoop::poll(self).await)
+    }
+}
+
+#[cfg(feature = "mqtt")]
+#[async_trait::async_trait]
+impl MqttPoll for mqtt5::EventLoop {
+    async fn poll(&mut self) -> Result<Polled, String> {
+        polled_v5(mqtt5::EventLoop::poll(self).await)
+    }
+}
+
+/// A subscriber's client handle, of whichever protocol version its
+/// connection speaks.
+#[cfg(feature = "mqtt")]
+enum SubscriberClient {
+    V3(AsyncClient),
+    V5(mqtt5::AsyncClient),
+}
+
+#[cfg(feature = "mqtt")]
+impl SubscriberClient {
+    /// Queue a `QoS` 1 subscription to `topic`.
+    async fn subscribe(&self, topic: String) -> Result<(), String> {
+        match self {
+            Self::V3(client) => client
+                .subscribe(topic, QoS::AtLeastOnce)
+                .await
+                .map_err(|err| err.to_string()),
+            Self::V5(client) => client
+                .subscribe(topic, mqtt5::mqttbytes::QoS::AtLeastOnce)
+                .await
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    /// Like [`subscribe`](Self::subscribe), without waiting for room in the
+    /// request queue.
+    fn try_subscribe(&self, topic: String) -> Result<(), String> {
+        match self {
+            Self::V3(client) => client
+                .try_subscribe(topic, QoS::AtLeastOnce)
+                .map_err(|err| err.to_string()),
+            Self::V5(client) => client
+                .try_subscribe(topic, mqtt5::mqttbytes::QoS::AtLeastOnce)
+                .map_err(|err| err.to_string()),
+        }
     }
 }
 
@@ -156,11 +272,8 @@ fn publish_json<T: serde::Serialize + ?Sized>(
 
 /// Queue a `QoS` 1 subscription to `topic` on `client`.
 #[cfg(feature = "mqtt")]
-async fn subscribe_to(client: &AsyncClient, topic: String) -> Result<(), EventError> {
-    client
-        .subscribe(topic, QoS::AtLeastOnce)
-        .await
-        .map_err(|err| EventError::Broker(err.to_string()))
+async fn subscribe_to(client: &SubscriberClient, topic: String) -> Result<(), EventError> {
+    client.subscribe(topic).await.map_err(EventError::Broker)
 }
 
 /// Decode one broker payload, skipping (with a warning) anything this crate
@@ -184,7 +297,7 @@ fn decode_event(payload: &[u8]) -> Option<CrudEvent> {
 /// delivers. Events the broker replays from a resumed session may arrive
 /// before the SUBACK; they are returned so none is lost.
 #[cfg(feature = "mqtt")]
-async fn await_subscription<P: MqttPoll>(
+async fn await_subscription<P: MqttPoll + ?Sized>(
     eventloop: &mut P,
     timeout: Duration,
 ) -> Result<VecDeque<CrudEvent>, EventError> {
@@ -192,21 +305,13 @@ async fn await_subscription<P: MqttPoll>(
         let mut backlog = VecDeque::new();
         loop {
             match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::SubAck(ack))) => {
-                    if ack
-                        .return_codes
-                        .iter()
-                        .any(|code| matches!(code, SubscribeReasonCode::Failure))
-                    {
-                        return Err(EventError::Broker("subscription refused".to_string()));
-                    }
-                    return Ok(backlog);
+                Ok(Polled::SubAck { refused: true }) => {
+                    return Err(EventError::Broker("subscription refused".to_string()));
                 }
-                Ok(Event::Incoming(Packet::Publish(publish))) => {
-                    backlog.extend(decode_event(&publish.payload));
-                }
+                Ok(Polled::SubAck { refused: false }) => return Ok(backlog),
+                Ok(Polled::Publish(payload)) => backlog.extend(decode_event(&payload)),
                 Ok(_) => {}
-                Err(err) => return Err(EventError::Broker(err.to_string())),
+                Err(err) => return Err(EventError::Broker(err)),
             }
         }
     };
@@ -442,6 +547,9 @@ enum Backend {
         host: String,
         port: u16,
         publisher: AsyncClient,
+        /// Session Expiry Interval, in seconds, for durable subscribers;
+        /// `None` keeps MQTT 3.1.1 sessions (see [`EventBus::with_session_ttl`]).
+        session_ttl: Option<u32>,
     },
     Mock(broadcast::Sender<CrudEvent>),
 }
@@ -494,6 +602,7 @@ impl EventBus {
             host: host.to_string(),
             port,
             publisher,
+            session_ttl: None,
         })
     }
 
@@ -534,6 +643,42 @@ impl EventBus {
     #[must_use]
     pub fn with_max_anonymous_connections(mut self, max: usize) -> Self {
         self.max_anonymous = max;
+        self
+    }
+
+    /// Bound abandoned durable sessions: durable subscribers
+    /// ([`subscribe`](Self::subscribe)) connect over MQTT 5.0 with Clean Start
+    /// off and a Session Expiry Interval of `ttl`, so the broker deletes a
+    /// session, and the events queued in it, that long after its connection
+    /// ends. A client that returns within `ttl` with its `subscriber_id` is
+    /// replayed exactly as without a TTL; one that returns later gets a fresh
+    /// session. Without this call (the default) durable subscribers stay on
+    /// MQTT 3.1.1 and expiry is left to the broker.
+    ///
+    /// Transient subscribers ([`subscribe_transient`](Self::subscribe_transient))
+    /// and the publisher stay on MQTT 3.1.1, which the broker bridges to
+    /// MQTT 5.0 subscribers. The broker must speak MQTT 5.0 and may cap the
+    /// interval (Mosquitto's `max_session_expiry_interval`). The mock bus
+    /// ignores the setting.
+    ///
+    /// # Panics
+    ///
+    /// If `ttl` is shorter than one second or longer than `u32::MAX` seconds,
+    /// which a Session Expiry Interval cannot carry (zero would mean "expire
+    /// on disconnect", which is what [`subscribe_transient`](Self::subscribe_transient)
+    /// is for).
+    #[must_use]
+    pub fn with_session_ttl(mut self, ttl: Duration) -> Self {
+        let seconds = u32::try_from(ttl.as_secs())
+            .ok()
+            .filter(|&seconds| seconds >= 1)
+            .expect("the session TTL must be between 1 and 4294967295 seconds");
+        #[cfg(feature = "mqtt")]
+        if let Backend::Mqtt { session_ttl, .. } = &mut self.backend {
+            *session_ttl = Some(seconds);
+        }
+        #[cfg(not(feature = "mqtt"))]
+        let _ = seconds;
         self
     }
 
@@ -672,9 +817,12 @@ impl EventBus {
             };
         let inner = match &self.backend {
             #[cfg(feature = "mqtt")]
-            Backend::Mqtt { host, port, .. } => {
-                open_mqtt(host, *port, resource, &subscriber_id, durable).await?
-            }
+            Backend::Mqtt {
+                host,
+                port,
+                session_ttl,
+                ..
+            } => open_mqtt(host, *port, resource, &subscriber_id, durable, *session_ttl).await?,
             Backend::Mock(sender) => Inner::Mock {
                 receiver: sender.subscribe(),
                 resource: resource.to_string(),
@@ -690,8 +838,9 @@ impl EventBus {
     }
 }
 
-/// Open one subscriber's MQTT session (persistent when `durable`) and wait
-/// for the broker to accept it and the subscription.
+/// Open one subscriber's MQTT session (persistent when `durable`, over MQTT
+/// 5.0 with an expiry when `session_ttl` is set too) and wait for the broker
+/// to accept it and the subscription.
 #[cfg(feature = "mqtt")]
 async fn open_mqtt(
     host: &str,
@@ -699,24 +848,40 @@ async fn open_mqtt(
     resource: &str,
     subscriber_id: &str,
     durable: bool,
+    session_ttl: Option<u32>,
 ) -> Result<Inner, EventError> {
-    let mut options = MqttOptions::new(client_id_for(resource, subscriber_id), host, port);
-    options.set_keep_alive(KEEP_ALIVE);
-    // The entire delivery guarantee: a persistent session keyed by this
-    // subscriber's own client id. The client id is never empty (it always
-    // carries the minted id), which is what keeps this call (which panics
-    // on an empty client id) safe. A transient subscriber asks for a clean
-    // session instead, which the broker discards when the connection ends.
-    options.set_clean_session(!durable);
-    let (client, mut eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+    let client_id = client_id_for(resource, subscriber_id);
+    let (client, mut eventloop): (SubscriberClient, Box<dyn MqttPoll>) =
+        if let Some(ttl) = session_ttl.filter(|_| durable) {
+            let mut options = mqtt5::MqttOptions::new(client_id, host, port);
+            options.set_keep_alive(KEEP_ALIVE);
+            // Clean Start 0 keeps the stored session; the interval is what
+            // makes the broker drop it after `ttl` once the connection ends.
+            options.set_clean_start(false);
+            options.set_session_expiry_interval(Some(ttl));
+            let (client, eventloop) = mqtt5::AsyncClient::new(options, CHANNEL_CAPACITY);
+            (SubscriberClient::V5(client), Box::new(eventloop))
+        } else {
+            let mut options = MqttOptions::new(client_id, host, port);
+            options.set_keep_alive(KEEP_ALIVE);
+            // The entire delivery guarantee: a persistent session keyed by
+            // this subscriber's own client id. The client id is never empty
+            // (it always carries the minted id), which is what keeps this
+            // call (which panics on an empty client id) safe. A transient
+            // subscriber asks for a clean session instead, which the broker
+            // discards when the connection ends.
+            options.set_clean_session(!durable);
+            let (client, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+            (SubscriberClient::V3(client), Box::new(eventloop))
+        };
     subscribe_to(&client, topic(resource)).await?;
-    let backlog = await_subscription(&mut eventloop, SUBSCRIBE_TIMEOUT).await?;
+    let backlog = await_subscription(&mut *eventloop, SUBSCRIBE_TIMEOUT).await?;
     Ok(Inner::Mqtt {
         // Kept alive alongside the event loop: dropping the client closes
         // the request channel and ends the loop.
         client,
         topic: topic(resource),
-        eventloop: Box::new(eventloop),
+        eventloop,
         errors: ErrorRun::default(),
         backlog,
     })
@@ -734,7 +899,7 @@ pub struct EventStream {
 enum Inner {
     #[cfg(feature = "mqtt")]
     Mqtt {
-        client: AsyncClient,
+        client: SubscriberClient,
         /// Subscribed again whenever the broker reports a reconnect without
         /// the session (a clean-session stream never has one to resume).
         topic: String,
@@ -805,9 +970,9 @@ impl EventStream {
                 }
                 loop {
                     match eventloop.poll().await {
-                        Ok(Event::Incoming(Packet::Publish(publish))) => {
+                        Ok(Polled::Publish(payload)) => {
                             errors.succeeded();
-                            if let Some(event) = decode_event(&publish.payload) {
+                            if let Some(event) = decode_event(&payload) {
                                 return Some(event);
                             }
                         }
@@ -815,10 +980,11 @@ impl EventStream {
                         // transient stream, or a durable session that
                         // expired) lost the subscription with it, so ask for
                         // it again or the stream would stay quiet for good.
-                        Ok(Event::Incoming(Packet::ConnAck(ack))) if !ack.session_present => {
+                        Ok(Polled::ConnAck {
+                            session_present: false,
+                        }) => {
                             errors.succeeded();
-                            if let Err(err) = client.try_subscribe(topic.clone(), QoS::AtLeastOnce)
-                            {
+                            if let Err(err) = client.try_subscribe(topic.clone()) {
                                 // Without the subscription the stream would stay
                                 // quiet for good; ending it tells the owner.
                                 tracing::warn!("mqtt resubscribe failed: {err}");
@@ -1089,10 +1255,12 @@ mod tests {
     #[cfg(feature = "mqtt")]
     #[async_trait::async_trait]
     impl MqttPoll for ScriptedEventLoop {
-        async fn poll(&mut self) -> Result<Event, ConnectionError> {
-            self.responses
-                .pop_front()
-                .expect("ScriptedEventLoop's scripted responses were exhausted")
+        async fn poll(&mut self) -> Result<Polled, String> {
+            polled_v3(
+                self.responses
+                    .pop_front()
+                    .expect("ScriptedEventLoop's scripted responses were exhausted"),
+            )
         }
     }
 
@@ -1102,7 +1270,7 @@ mod tests {
         let (client, _real_eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
         EventStream {
             inner: Inner::Mqtt {
-                client,
+                client: SubscriberClient::V3(client),
                 topic: topic("widgets"),
                 eventloop: Box::new(ScriptedEventLoop::new(responses)),
                 errors: ErrorRun::default(),
@@ -1171,9 +1339,9 @@ mod tests {
     #[cfg(feature = "mqtt")]
     #[async_trait::async_trait]
     impl MqttPoll for FirstErrorThenPendingForever {
-        async fn poll(&mut self) -> Result<Event, ConnectionError> {
+        async fn poll(&mut self) -> Result<Polled, String> {
             match self.0.pop_front() {
-                Some(result) => result,
+                Some(result) => polled_v3(result),
                 None => std::future::pending().await,
             }
         }
@@ -1191,6 +1359,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1883,
             publisher,
+            session_ttl: None,
         });
         bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
             .await;
@@ -1207,6 +1376,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 1,
             publisher,
+            session_ttl: None,
         });
         bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
             .await;
@@ -1223,6 +1393,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 1,
             publisher,
+            session_ttl: None,
         });
         let err = bus.subscribe("widgets", None).await.err().unwrap();
         assert!(matches!(err, EventError::Broker(_)), "{err}");
@@ -1294,10 +1465,10 @@ mod tests {
     #[cfg(feature = "mqtt")]
     #[async_trait::async_trait]
     impl MqttPoll for SlowEventLoop {
-        async fn poll(&mut self) -> Result<Event, ConnectionError> {
+        async fn poll(&mut self) -> Result<Polled, String> {
             let (pause, result) = self.0.pop_front().expect("SlowEventLoop script exhausted");
             tokio::time::sleep(pause).await;
-            result
+            polled_v3(result)
         }
     }
 
@@ -1347,7 +1518,7 @@ mod tests {
         let (client, _real) = AsyncClient::new(MqttOptions::new("t", "localhost", 1883), 1);
         let mut stream = EventStream {
             inner: Inner::Mqtt {
-                client,
+                client: SubscriberClient::V3(client),
                 topic: topic("widgets"),
                 eventloop: Box::new(SlowEventLoop(script)),
                 errors: ErrorRun::default(),
@@ -1366,7 +1537,7 @@ mod tests {
         let (client, _real) = AsyncClient::new(MqttOptions::new("t", "localhost", 1883), 1);
         let mut stream = EventStream {
             inner: Inner::Mqtt {
-                client,
+                client: SubscriberClient::V3(client),
                 topic: topic("widgets"),
                 eventloop: Box::new(ScriptedEventLoop::new(vec![Ok(publish_event(&live))])),
                 errors: ErrorRun::default(),
@@ -1413,7 +1584,7 @@ mod tests {
         let (client, _requests) = AsyncClient::new(options, CHANNEL_CAPACITY);
         let mut stream = EventStream {
             inner: Inner::Mqtt {
-                client,
+                client: SubscriberClient::V3(client),
                 topic: topic("widgets"),
                 eventloop: Box::new(ScriptedEventLoop::new(script())),
                 errors: ErrorRun::default(),
@@ -1504,7 +1675,136 @@ mod tests {
     #[tokio::test]
     async fn subscribe_to_reports_a_closed_request_channel_as_a_broker_error() {
         let client = client_with_closed_request_channel();
-        let err = subscribe_to(&client, "t".to_string()).await.unwrap_err();
+        let err = subscribe_to(&SubscriberClient::V3(client), "t".to_string())
+            .await
+            .unwrap_err();
         assert!(matches!(err, EventError::Broker(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "between 1 and 4294967295 seconds")]
+    fn a_session_ttl_under_one_second_is_refused() {
+        let _ = EventBus::mock().with_session_ttl(Duration::from_millis(999));
+    }
+
+    #[test]
+    #[should_panic(expected = "between 1 and 4294967295 seconds")]
+    fn a_session_ttl_beyond_the_expiry_interval_range_is_refused() {
+        let _ = EventBus::mock().with_session_ttl(Duration::from_secs(u64::from(u32::MAX) + 1));
+    }
+
+    #[tokio::test]
+    async fn the_mock_bus_ignores_a_session_ttl() {
+        let bus = EventBus::mock().with_session_ttl(Duration::from_secs(u64::from(u32::MAX)));
+        let (_, mut stream) = bus.subscribe("widgets", None).await.unwrap();
+        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
+            .await;
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![1]);
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_session_ttl_is_kept_whole_seconds_on_the_mqtt_bus() {
+        let (publisher, _eventloop) =
+            AsyncClient::new(MqttOptions::new("test-publisher", "localhost", 1), 1);
+        let bus = EventBus::with_backend(Backend::Mqtt {
+            host: "localhost".to_string(),
+            port: 1,
+            publisher,
+            session_ttl: None,
+        })
+        .with_session_ttl(Duration::from_millis(3_600_999));
+        assert!(matches!(
+            bus.backend,
+            Backend::Mqtt {
+                session_ttl: Some(3600),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_v5_durable_subscribe_while_the_broker_is_down_is_an_error() {
+        let (publisher, _eventloop) =
+            AsyncClient::new(MqttOptions::new("test-publisher", "localhost", 1), 1);
+        let bus = EventBus::with_backend(Backend::Mqtt {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            publisher,
+            session_ttl: None,
+        })
+        .with_session_ttl(Duration::from_secs(60));
+        let err = bus.subscribe("widgets", None).await.err().unwrap();
+        assert!(matches!(err, EventError::Broker(_)), "{err}");
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[test]
+    fn mqtt5_poll_results_reduce_to_what_the_stream_acts_on() {
+        use mqtt5::mqttbytes::QoS as Qos5;
+        use mqtt5::mqttbytes::v5::{
+            ConnAck as ConnAck5, ConnectReturnCode as Code5, Packet as Packet5,
+            Publish as Publish5, SubAck as SubAck5, SubscribeReasonCode as Reason5,
+        };
+        let incoming = |packet| Ok(mqtt5::Event::Incoming(packet));
+
+        let publish = Publish5::new("t", Qos5::AtLeastOnce, b"payload".to_vec(), None);
+        assert!(matches!(
+            polled_v5(incoming(Packet5::Publish(publish))),
+            Ok(Polled::Publish(payload)) if payload == b"payload"
+        ));
+        let conn_ack = ConnAck5 {
+            session_present: true,
+            code: Code5::Success,
+            properties: None,
+        };
+        assert!(matches!(
+            polled_v5(incoming(Packet5::ConnAck(conn_ack))),
+            Ok(Polled::ConnAck {
+                session_present: true
+            })
+        ));
+        let sub_ack = |code| {
+            incoming(Packet5::SubAck(SubAck5 {
+                pkid: 1,
+                return_codes: vec![code],
+                properties: None,
+            }))
+        };
+        assert!(matches!(
+            polled_v5(sub_ack(Reason5::Success(Qos5::AtLeastOnce))),
+            Ok(Polled::SubAck { refused: false })
+        ));
+        assert!(matches!(
+            polled_v5(sub_ack(Reason5::NotAuthorized)),
+            Ok(Polled::SubAck { refused: true })
+        ));
+        assert!(matches!(
+            polled_v5(incoming(Packet5::PingResp(mqtt5::mqttbytes::v5::PingResp))),
+            Ok(Polled::Other)
+        ));
+        assert!(polled_v5(Err(mqtt5::ConnectionError::RequestsDone)).is_err());
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_v5_subscriber_client_queues_subscriptions_and_reports_a_closed_channel() {
+        let open = || {
+            mqtt5::AsyncClient::new(
+                mqtt5::MqttOptions::new("test-v5", "localhost", 1883),
+                CHANNEL_CAPACITY,
+            )
+        };
+        let (client, _eventloop) = open();
+        let client = SubscriberClient::V5(client);
+        client.subscribe("t".to_string()).await.unwrap();
+        client.try_subscribe("t".to_string()).unwrap();
+
+        let (client, eventloop) = open();
+        drop(eventloop);
+        let client = SubscriberClient::V5(client);
+        assert!(client.subscribe("t".to_string()).await.is_err());
+        assert!(client.try_subscribe("t".to_string()).is_err());
     }
 }

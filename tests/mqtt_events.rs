@@ -12,7 +12,10 @@
 //!   when the same `subscriber_id` reconnects (the persistent session);
 //! - a *transient* subscriber (clean session) leaves nothing to replay;
 //! - reconnecting with a *different* id gets no replay, which is the
-//!   guarantee's stated limit rather than a bug.
+//!   guarantee's stated limit rather than a bug;
+//! - with a session TTL (MQTT 5.0 Session Expiry Interval) a returning id is
+//!   still replayed within the TTL, the session is gone after it, an unset
+//!   TTL leaves the session alone, and transient subscribers are unaffected.
 //!
 //! Every test uses a resource name (and therefore a topic) unique to the
 //! run, so a leftover persistent session from an earlier run can never
@@ -346,5 +349,109 @@ async fn a_subscriber_id_is_scoped_to_its_resource() {
     assert_ne!(
         issued, id,
         "an id minted for one resource is not valid for another"
+    );
+}
+
+/// A bus whose durable subscribers connect over MQTT 5.0 with `ttl_seconds`.
+fn broker_with_session_ttl(ttl_seconds: u64) -> EventBus {
+    broker().with_session_ttl(Duration::from_secs(ttl_seconds))
+}
+
+/// Subscribe durably, deliver one live event (a v3 publisher reaching a v5
+/// subscriber when `bus` has a TTL), disconnect, then publish a second event
+/// while the subscriber is away. Returns the id to come back with.
+async fn leave_one_event_queued(bus: &EventBus, resource: &str) -> String {
+    let (subscriber_id, mut stream) = bus.subscribe(resource, None).await.unwrap();
+    settle(&mut stream).await;
+    bus.publish(CrudEvent::new(resource, EventAction::Create, vec![1]))
+        .await;
+    let live = next_within(&mut stream, RECEIVE_TIMEOUT)
+        .await
+        .expect("a v3 publish must reach the subscriber on the same topic");
+    assert_eq!(live.ids, vec![1]);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    bus.publish(CrudEvent::new(resource, EventAction::Update, vec![2]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    subscriber_id
+}
+
+#[tokio::test]
+async fn a_session_ttl_session_replays_within_the_ttl() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker_with_session_ttl(30);
+    let subscriber_id = leave_one_event_queued(&bus, &resource).await;
+
+    let (resumed_id, mut second) = bus
+        .subscribe(&resource, Some(&subscriber_id))
+        .await
+        .unwrap();
+    assert_eq!(resumed_id, subscriber_id);
+    let replayed = next_within(&mut second, RECEIVE_TIMEOUT)
+        .await
+        .expect("a session inside its TTL must replay what was queued");
+    assert_eq!(replayed.ids, vec![2]);
+}
+
+#[tokio::test]
+async fn a_session_ttl_session_is_gone_after_the_ttl() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker_with_session_ttl(2);
+    let subscriber_id = leave_one_event_queued(&bus, &resource).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let (resumed_id, mut second) = bus
+        .subscribe(&resource, Some(&subscriber_id))
+        .await
+        .unwrap();
+    assert_eq!(resumed_id, subscriber_id);
+    assert!(
+        next_within(&mut second, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "the broker must have dropped the expired session and its queue"
+    );
+}
+
+#[tokio::test]
+async fn without_a_session_ttl_the_session_survives_the_same_wait() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker();
+    let subscriber_id = leave_one_event_queued(&bus, &resource).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let (_, mut second) = bus
+        .subscribe(&resource, Some(&subscriber_id))
+        .await
+        .unwrap();
+    let replayed = next_within(&mut second, RECEIVE_TIMEOUT)
+        .await
+        .expect("an unset TTL leaves the session to the broker");
+    assert_eq!(replayed.ids, vec![2]);
+}
+
+#[tokio::test]
+async fn a_transient_subscriber_is_unaffected_by_the_session_ttl() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker_with_session_ttl(30);
+
+    let (subscriber_id, mut first) = bus.subscribe_transient(&resource, None).await.unwrap();
+    settle(&mut first).await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    bus.publish(CrudEvent::new(&resource, EventAction::Update, vec![2]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (_, mut second) = bus
+        .subscribe_transient(&resource, Some(&subscriber_id))
+        .await
+        .unwrap();
+    assert!(
+        next_within(&mut second, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "a clean session is not kept, whatever the TTL"
     );
 }
