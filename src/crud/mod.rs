@@ -36,6 +36,7 @@ where
         skip: u64,
         limit: u64,
         include_archived: bool,
+        only_archived: bool,
         filters: Vec<FilterClause>,
         sort: Vec<SortClause>,
     ) -> Result<Vec<R::Model>, RepoError> {
@@ -45,6 +46,7 @@ where
                 skip,
                 limit,
                 include_archived,
+                only_archived,
                 filters,
                 sort,
             })
@@ -52,7 +54,7 @@ where
     }
 
     /// How many non-archived (unless `include_archived`) records match
-    /// `filters`; callers use this to cap a bulk update/delete before it
+    /// `filters`, or only the archived ones when `only_archived`; callers use this to cap a bulk update/delete before it
     /// runs.
     ///
     /// # Errors
@@ -62,8 +64,11 @@ where
         &self,
         filters: &[FilterClause],
         include_archived: bool,
+        only_archived: bool,
     ) -> Result<u64, RepoError> {
-        self.repository.count(filters, include_archived).await
+        self.repository
+            .count(filters, include_archived, only_archived)
+            .await
     }
 
     /// The record `id`, or `None` when it does not exist.
@@ -191,6 +196,7 @@ mod tests {
             &self,
             filters: &[FilterClause],
             _include_archived: bool,
+            _only_archived: bool,
         ) -> Result<u64, RepoError> {
             *self.count_filters.lock().unwrap() = Some(filters.to_vec());
             Ok(filters.len() as u64)
@@ -235,7 +241,10 @@ mod tests {
     #[tokio::test]
     async fn list_clamps_a_zero_limit_up_to_one() {
         let service = CrudService::new(FakeRepository::default());
-        service.list(0, 0, false, vec![], vec![]).await.unwrap();
+        service
+            .list(0, 0, false, false, vec![], vec![])
+            .await
+            .unwrap();
         let opts = service
             .repository
             .list_opts
@@ -250,7 +259,7 @@ mod tests {
     async fn list_clamps_a_limit_above_max_down_to_max() {
         let service = CrudService::new(FakeRepository::default());
         service
-            .list(0, 10_000, false, vec![], vec![])
+            .list(0, 10_000, false, false, vec![], vec![])
             .await
             .unwrap();
         let opts = service
@@ -266,7 +275,10 @@ mod tests {
     #[tokio::test]
     async fn list_passes_an_in_range_limit_through_unchanged() {
         let service = CrudService::new(FakeRepository::default());
-        service.list(5, 50, true, vec![], vec![]).await.unwrap();
+        service
+            .list(5, 50, true, true, vec![], vec![])
+            .await
+            .unwrap();
         let opts = service
             .repository
             .list_opts
@@ -277,6 +289,7 @@ mod tests {
         assert_eq!(opts.limit, 50);
         assert_eq!(opts.skip, 5);
         assert!(opts.include_archived);
+        assert!(opts.only_archived);
     }
 
     #[tokio::test]
@@ -292,7 +305,7 @@ mod tests {
             descending: true,
         }];
         service
-            .list(0, 10, false, filters.clone(), sort.clone())
+            .list(0, 10, false, false, filters.clone(), sort.clone())
             .await
             .unwrap();
         let opts = service
@@ -323,7 +336,7 @@ mod tests {
             op: FilterOp::Gte,
             value: FilterValue::Int(0),
         }];
-        assert_eq!(service.count(&filters, false).await.unwrap(), 1);
+        assert_eq!(service.count(&filters, false, false).await.unwrap(), 1);
     }
 
     #[tokio::test]

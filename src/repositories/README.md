@@ -12,6 +12,11 @@ Storage-agnostic CRUD access, backing `crud/`.
 - `filtering.rs` — `FilterOp`/`FilterClause`/`FilterValue`/`SortClause`, the
   vocabulary each repository interprets itself.
 
+`ListOptions::only_archived` and `count`'s `only_archived` argument narrow a
+read to the archived rows (`archived_at IS NOT NULL`) and take precedence over
+`include_archived`; see
+[ADR 0006](../../docs/adrs/0006-only-archived-list-param.md).
+
 A host's SQL and in-memory repositories live in the host. `tests/support`
 holds a plain-`sqlx` example used by the integration tests.
 

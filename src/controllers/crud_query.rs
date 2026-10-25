@@ -30,8 +30,9 @@ use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortCl
 use crate::views::FieldError;
 
 /// Query params never treated as a filter/sort key, regardless of a
-/// resource's own field table: the six reserved keys of the CRUD manifest
-/// (`skip`, `limit`, `sort`, `id`, `include_archived`, `include_unpublished`).
+/// resource's own field table: the reserved keys of the CRUD manifest
+/// (`skip`, `limit`, `sort`, `id`, `include_archived`, `only_archived`,
+/// `include_unpublished`).
 /// `include_unpublished` is reserved even though this crate has no draft or
 /// schedule lifecycle, so a client built for the manifest can send it to any
 /// server of the family.
@@ -41,6 +42,7 @@ pub const RESERVED_PARAMS: &[&str] = &[
     "limit",
     "sort",
     "include_archived",
+    "only_archived",
     "include_unpublished",
 ];
 
@@ -164,12 +166,104 @@ fn cast_one(kind: FieldKind, raw: &str) -> Option<FilterValue> {
             .filter(|value| value.is_finite())
             .map(FilterValue::Float),
         FieldKind::DateTime => cast_datetime(raw.trim()).map(FilterValue::DateTime),
-        FieldKind::Boolean => match raw.trim().to_lowercase().as_str() {
-            "true" | "1" => Some(FilterValue::Bool(true)),
-            "false" | "0" => Some(FilterValue::Bool(false)),
-            _ => None,
-        },
+        FieldKind::Boolean => cast_bool(raw).map(FilterValue::Bool),
     }
+}
+
+/// The boolean vocabulary shared by boolean filters and the flag keys:
+/// `true`/`1` and `false`/`0`, case-insensitive.
+fn cast_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// The last value of `key`, as `QueryParams.get` returns it in `lib-crud-py`.
+fn last_value<'a, K: AsRef<str>, V: AsRef<str>>(
+    params: &'a [(K, V)],
+    key: &str,
+) -> Option<&'a str> {
+    params
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_ref() == key)
+        .map(|(_, v)| v.as_ref())
+}
+
+/// Parse a `?<key>=true|false` flag, `None` when the key is absent.
+fn parse_flag<K: AsRef<str>, V: AsRef<str>>(
+    params: &[(K, V)],
+    key: &'static str,
+) -> Result<Option<bool>, Vec<FieldError>> {
+    match last_value(params, key) {
+        None => Ok(None),
+        Some(raw) => cast_bool(raw)
+            .map(Some)
+            .ok_or_else(|| vec![FieldError::new(key, "invalid filter value")]),
+    }
+}
+
+/// Parse the `?only_archived=true` flag an archivable list accepts: `true`
+/// narrows a list to the rows with `archived_at` set. It implies
+/// `include_archived`, so `true` next to an explicit `include_archived=false`
+/// is contradictory. Absent or `false` is `false` and changes nothing.
+///
+/// # Errors
+///
+/// A [`FieldError`] on `only_archived` for a malformed value or for the
+/// contradictory pair (`cannot be combined with include_archived=false`);
+/// on `include_archived` when `only_archived=true` accompanies a malformed
+/// `include_archived`. A caller wraps them in
+/// [`CrudError::UnprocessableEntity`](crate::error::CrudError::UnprocessableEntity).
+pub fn parse_only_archived<K: AsRef<str>, V: AsRef<str>>(
+    params: &[(K, V)],
+) -> Result<bool, Vec<FieldError>> {
+    let only_archived = parse_flag(params, "only_archived")?.unwrap_or(false);
+    if only_archived && parse_flag(params, "include_archived")? == Some(false) {
+        return Err(vec![FieldError::new(
+            "only_archived",
+            "cannot be combined with include_archived=false",
+        )]);
+    }
+    Ok(only_archived)
+}
+
+/// Parse the `?include_archived=true` flag. Also validates `only_archived`
+/// (see [`parse_only_archived`]), so every route that reads this flag rejects
+/// the contradictory pair and a malformed `only_archived` alike.
+///
+/// # Errors
+///
+/// As [`parse_only_archived`], plus a [`FieldError`] on `include_archived`
+/// for a malformed value.
+pub fn parse_include_archived<K: AsRef<str>, V: AsRef<str>>(
+    params: &[(K, V)],
+) -> Result<bool, Vec<FieldError>> {
+    parse_only_archived(params)?;
+    Ok(parse_flag(params, "include_archived")?.unwrap_or(false))
+}
+
+/// Refuse `?only_archived=true` on a route that cannot honour it: only a list
+/// read narrows by it, and a write, a restore, `/stats` or a single-record
+/// read that carried it would otherwise act on live rows when the caller
+/// meant the trash.
+///
+/// # Errors
+///
+/// As [`parse_only_archived`], and a [`FieldError`] on `only_archived`
+/// (`applies to list reads only`) when it is `true`.
+pub fn reject_only_archived<K: AsRef<str>, V: AsRef<str>>(
+    params: &[(K, V)],
+) -> Result<(), Vec<FieldError>> {
+    if parse_only_archived(params)? {
+        return Err(vec![FieldError::new(
+            "only_archived",
+            "applies to list reads only",
+        )]);
+    }
+    Ok(())
 }
 
 /// Parse every non-reserved query param into a `FilterClause`, validated
@@ -401,6 +495,7 @@ mod tests {
                 ("skip", "5"),
                 ("limit", "10"),
                 ("include_archived", "true"),
+                ("only_archived", "true"),
                 ("include_unpublished", "true"),
                 ("sort", "name"),
             ]),
@@ -419,6 +514,7 @@ mod tests {
             "sort",
             "id",
             "include_archived",
+            "only_archived",
             "include_unpublished",
         ] {
             assert!(RESERVED_PARAMS.contains(&key), "{key}");
@@ -569,5 +665,129 @@ mod tests {
     fn cast_one_boolean_is_none_for_an_unrecognized_value() {
         let errors = parse_filters(SPECS, &params(&[("is_locked", "maybe")])).unwrap_err();
         assert_eq!(errors.len(), 1);
+    }
+
+    fn only_archived_error(pairs: &[(&str, &str)]) -> (String, String) {
+        let errors = parse_only_archived(&params(pairs)).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        (errors[0].field.to_string(), errors[0].msg.clone())
+    }
+
+    #[test]
+    fn only_archived_is_false_when_absent_or_false() {
+        assert!(!parse_only_archived(&params(&[])).unwrap());
+        for raw in ["false", "0", "FALSE", " False "] {
+            assert!(!parse_only_archived(&params(&[("only_archived", raw)])).unwrap());
+        }
+    }
+
+    #[test]
+    fn only_archived_takes_true_and_1_case_insensitively() {
+        for raw in ["true", "1", "TRUE", "True"] {
+            assert!(parse_only_archived(&params(&[("only_archived", raw)])).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_malformed_only_archived_is_invalid_filter_value() {
+        for raw in ["maybe", "", "yes", "2"] {
+            assert_eq!(
+                only_archived_error(&[("only_archived", raw)]),
+                (
+                    "only_archived".to_string(),
+                    "invalid filter value".to_string()
+                ),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_only_archived_wins() {
+        let pairs = params(&[("only_archived", "false"), ("only_archived", "true")]);
+        assert!(parse_only_archived(&pairs).unwrap());
+    }
+
+    #[test]
+    fn only_archived_true_with_include_archived_false_is_contradictory() {
+        for raw in ["false", "0"] {
+            assert_eq!(
+                only_archived_error(&[("only_archived", "true"), ("include_archived", raw)]),
+                (
+                    "only_archived".to_string(),
+                    "cannot be combined with include_archived=false".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn only_archived_true_with_include_archived_true_or_none_is_fine() {
+        let pairs = params(&[("only_archived", "true"), ("include_archived", "true")]);
+        assert!(parse_only_archived(&pairs).unwrap());
+        let pairs = params(&[("only_archived", "false"), ("include_archived", "false")]);
+        assert!(!parse_only_archived(&pairs).unwrap());
+    }
+
+    #[test]
+    fn only_archived_true_with_a_malformed_include_archived_names_include_archived() {
+        assert_eq!(
+            only_archived_error(&[("only_archived", "true"), ("include_archived", "maybe")]),
+            (
+                "include_archived".to_string(),
+                "invalid filter value".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_include_archived_also_validates_only_archived() {
+        assert!(!parse_include_archived(&params(&[])).unwrap());
+        assert!(parse_include_archived(&params(&[("include_archived", "1")])).unwrap());
+        assert!(
+            parse_include_archived(&params(&[
+                ("include_archived", "true"),
+                ("only_archived", "true")
+            ]))
+            .unwrap()
+        );
+        let errors = parse_include_archived(&params(&[("include_archived", "maybe")])).unwrap_err();
+        assert_eq!(errors[0].field, "include_archived");
+        let errors = parse_include_archived(&params(&[("only_archived", "maybe")])).unwrap_err();
+        assert_eq!(errors[0].field, "only_archived");
+        let errors = parse_include_archived(&params(&[
+            ("include_archived", "false"),
+            ("only_archived", "true"),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            errors[0].msg,
+            "cannot be combined with include_archived=false"
+        );
+    }
+
+    #[test]
+    fn reject_only_archived_refuses_true_and_accepts_false_or_absent() {
+        assert!(reject_only_archived(&params(&[])).is_ok());
+        assert!(reject_only_archived(&params(&[("only_archived", "false")])).is_ok());
+        assert_eq!(
+            only_archived_reject_error(&[("only_archived", "1")]),
+            "applies to list reads only"
+        );
+        // The contradictory pair and a malformed value keep their own message.
+        assert_eq!(
+            only_archived_reject_error(&[("only_archived", "true"), ("include_archived", "0")]),
+            "cannot be combined with include_archived=false"
+        );
+        assert_eq!(
+            only_archived_reject_error(&[("only_archived", "x")]),
+            "invalid filter value"
+        );
+    }
+
+    fn only_archived_reject_error(pairs: &[(&str, &str)]) -> String {
+        let errors = reject_only_archived(&params(pairs)).unwrap_err();
+        assert_eq!(errors[0].field, "only_archived");
+        errors[0].msg.clone()
     }
 }

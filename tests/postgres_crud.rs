@@ -5,8 +5,8 @@
 mod support;
 
 use craftainer_crud::controllers::crud_actions::{
-    DeleteOutcome, ListOrGet, UpdateOutcome, resolve_delete, resolve_list_or_get, resolve_update,
-    resolve_update_by_id,
+    ArchivedScope, DeleteOutcome, ListOrGet, UpdateOutcome, resolve_delete, resolve_list_or_get,
+    resolve_update, resolve_update_by_id,
 };
 use craftainer_crud::controllers::crud_query::{FieldSpec, parse_filters, parse_sort};
 use craftainer_crud::crud::CrudService;
@@ -60,10 +60,16 @@ fn filters(pairs: &[(&str, &str)]) -> Vec<FilterClause> {
 async fn created_records_can_be_listed_paged_and_fetched() {
     let service = seeded().await;
 
-    let all = service.list(0, 100, false, vec![], vec![]).await.unwrap();
+    let all = service
+        .list(0, 100, false, false, vec![], vec![])
+        .await
+        .unwrap();
     assert_eq!(names(&all), ["gizmo", "gadget", "Sprocket", "widget_%"]);
 
-    let page = service.list(1, 2, false, vec![], vec![]).await.unwrap();
+    let page = service
+        .list(1, 2, false, false, vec![], vec![])
+        .await
+        .unwrap();
     assert_eq!(names(&page), ["gadget", "Sprocket"]);
 
     let one = service.get(all[0].id, false).await.unwrap().unwrap();
@@ -78,7 +84,10 @@ async fn filters_parsed_from_a_query_string_reach_the_database() {
         let service = &service;
         let filters = filters(pairs);
         async move {
-            let widgets = service.list(0, 100, false, filters, vec![]).await.unwrap();
+            let widgets = service
+                .list(0, 100, false, false, filters, vec![])
+                .await
+                .unwrap();
             names(&widgets)
                 .iter()
                 .map(ToString::to_string)
@@ -131,7 +140,7 @@ async fn every_filter_operator_is_interpreted() {
         (FilterOp::Gt, 1),
         (FilterOp::Gte, 2),
     ] {
-        let count = service.count(&[clause(op, 7)], false).await.unwrap();
+        let count = service.count(&[clause(op, 7)], false, false).await.unwrap();
         assert_eq!(count, expected, "{op:?}");
     }
     let by_bool = FilterClause {
@@ -139,18 +148,24 @@ async fn every_filter_operator_is_interpreted() {
         op: FilterOp::In,
         value: FilterValue::List(vec![FilterValue::Int(-1)]),
     };
-    assert_eq!(service.count(&[by_bool], false).await.unwrap(), 0);
+    assert_eq!(service.count(&[by_bool], false, false).await.unwrap(), 0);
 }
 
 #[tokio::test]
 async fn sorting_orders_the_page() {
     let service = seeded().await;
     let sort = parse_sort(SPECS, &params(&[("sort", "-quantity")])).unwrap();
-    let widgets = service.list(0, 100, false, vec![], sort).await.unwrap();
+    let widgets = service
+        .list(0, 100, false, false, vec![], sort)
+        .await
+        .unwrap();
     assert_eq!(names(&widgets), ["Sprocket", "gadget", "widget_%", "gizmo"]);
 
     let sort = parse_sort(SPECS, &params(&[("sort", "name,quantity")])).unwrap();
-    let widgets = service.list(0, 100, false, vec![], sort).await.unwrap();
+    let widgets = service
+        .list(0, 100, false, false, vec![], sort)
+        .await
+        .unwrap();
     assert_eq!(names(&widgets), ["Sprocket", "gadget", "gizmo", "widget_%"]);
 }
 
@@ -163,7 +178,7 @@ async fn an_unknown_column_is_a_backend_error_mapped_to_internal() {
         value: FilterValue::Int(1),
     };
     let err = service
-        .list(0, 10, false, vec![bad.clone()], vec![])
+        .list(0, 10, false, false, vec![bad.clone()], vec![])
         .await
         .unwrap_err();
     assert!(matches!(err, RepoError::Backend(_)));
@@ -175,7 +190,7 @@ async fn an_unknown_column_is_a_backend_error_mapped_to_internal() {
     };
     assert!(
         service
-            .list(0, 10, false, vec![], vec![bad_sort])
+            .list(0, 10, false, false, vec![], vec![bad_sort])
             .await
             .is_err()
     );
@@ -185,41 +200,59 @@ async fn an_unknown_column_is_a_backend_error_mapped_to_internal() {
         op: FilterOp::In,
         value: FilterValue::List(vec![FilterValue::List(vec![])]),
     };
-    assert!(service.count(&[nested], false).await.is_err());
+    assert!(service.count(&[nested], false, false).await.is_err());
 }
 
 #[tokio::test]
 async fn resolve_list_or_get_returns_one_record_or_a_page() {
     let service = seeded().await;
 
-    let ListOrGet::Many(page) = resolve_list_or_get(&service, None, 0, 2, false, vec![], vec![])
-        .await
-        .unwrap()
+    let ListOrGet::Many(page) =
+        resolve_list_or_get(&service, None, 0, 2, ArchivedScope::Live, vec![], vec![])
+            .await
+            .unwrap()
     else {
         panic!("expected a page");
     };
     assert_eq!(page.len(), 2);
 
-    let ListOrGet::One(one) =
-        resolve_list_or_get(&service, Some(page[0].id), 0, 10, false, vec![], vec![])
-            .await
-            .unwrap()
-    else {
+    let ListOrGet::One(one) = resolve_list_or_get(
+        &service,
+        Some(page[0].id),
+        0,
+        10,
+        ArchivedScope::Live,
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap() else {
         panic!("expected one record");
     };
     assert_eq!(one.id, page[0].id);
 
-    let err = resolve_list_or_get(&service, Some(99_999), 0, 10, false, vec![], vec![])
-        .await
-        .err()
-        .unwrap();
+    let err = resolve_list_or_get(
+        &service,
+        Some(99_999),
+        0,
+        10,
+        ArchivedScope::Live,
+        vec![],
+        vec![],
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, CrudError::NotFound(_)));
 }
 
 #[tokio::test]
 async fn updates_are_scoped_to_the_owner() {
     let service = seeded().await;
-    let all = service.list(0, 100, false, vec![], vec![]).await.unwrap();
+    let all = service
+        .list(0, 100, false, false, vec![], vec![])
+        .await
+        .unwrap();
     let alices = all[0].id;
     let patch = || WidgetPatch {
         name: Some("renamed".to_string()),
@@ -289,7 +322,10 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
     assert_eq!(result.matched, 3);
     assert_eq!(result.ids.len(), 3);
     let bobs = filters(&[("name", "widget_%")]);
-    let bob = service.list(0, 10, false, bobs, vec![]).await.unwrap();
+    let bob = service
+        .list(0, 10, false, false, bobs, vec![])
+        .await
+        .unwrap();
     assert_eq!(bob[0].quantity, 5);
 
     let DeleteOutcome::Bulk(result) =
@@ -300,7 +336,7 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
         panic!("expected a bulk result");
     };
     assert_eq!(result.matched, 3);
-    assert_eq!(service.count(&[], false).await.unwrap(), 1);
+    assert_eq!(service.count(&[], false, false).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -308,14 +344,20 @@ async fn a_float_filter_compares_against_the_stored_column() {
     let service = seeded().await;
     let float_specs = [FieldSpec::float("quantity"), FieldSpec::string("name")];
     let clauses = parse_filters(&float_specs, &params(&[("quantity__min", "6.5")])).unwrap();
-    let found = service.list(0, 100, false, clauses, vec![]).await.unwrap();
+    let found = service
+        .list(0, 100, false, false, clauses, vec![])
+        .await
+        .unwrap();
     assert_eq!(names(&found), ["gadget", "Sprocket"]);
 }
 
 #[tokio::test]
 async fn an_id_together_with_filters_is_refused_before_anything_runs() {
     let service = seeded().await;
-    let all = service.list(0, 100, false, vec![], vec![]).await.unwrap();
+    let all = service
+        .list(0, 100, false, false, vec![], vec![])
+        .await
+        .unwrap();
     let id = all[0].id;
     // `DELETE ?id=..&quantity__min=1000` must not delete the record just
     // because the guard the caller wrote was dropped.
@@ -325,10 +367,18 @@ async fn an_id_together_with_filters_is_refused_before_anything_runs() {
         quantity: None,
     };
 
-    let err = resolve_list_or_get(&service, Some(id), 0, 10, false, guard.clone(), vec![])
-        .await
-        .err()
-        .unwrap();
+    let err = resolve_list_or_get(
+        &service,
+        Some(id),
+        0,
+        10,
+        ArchivedScope::Live,
+        guard.clone(),
+        vec![],
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
     let err = resolve_update(&service, Some(id), "alice", guard.clone(), patch(), 10)
         .await
@@ -347,7 +397,10 @@ async fn an_id_together_with_filters_is_refused_before_anything_runs() {
 #[tokio::test]
 async fn deleting_soft_deletes_and_hides_the_record() {
     let service = seeded().await;
-    let all = service.list(0, 100, false, vec![], vec![]).await.unwrap();
+    let all = service
+        .list(0, 100, false, false, vec![], vec![])
+        .await
+        .unwrap();
     let id = all[0].id;
 
     // Bob cannot delete alice's record.
@@ -373,10 +426,113 @@ async fn deleting_soft_deletes_and_hides_the_record() {
     assert!(service.get(id, false).await.unwrap().is_none());
     let archived = service.get(id, true).await.unwrap().unwrap();
     assert!(archived.archived_at.is_some());
-    assert_eq!(service.count(&[], false).await.unwrap(), 3);
-    assert_eq!(service.count(&[], true).await.unwrap(), 4);
-    let listed = service.list(0, 100, true, vec![], vec![]).await.unwrap();
+    assert_eq!(service.count(&[], false, false).await.unwrap(), 3);
+    assert_eq!(service.count(&[], true, false).await.unwrap(), 4);
+    let listed = service
+        .list(0, 100, true, false, vec![], vec![])
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 4);
+}
+
+#[tokio::test]
+async fn only_archived_lists_and_counts_just_the_archived_rows() {
+    let service = seeded().await;
+    let all = service
+        .list(0, 100, false, false, vec![], vec![])
+        .await
+        .unwrap();
+    let id = all[0].id;
+    let doomed = all[1].id;
+    for victim in [id, doomed] {
+        resolve_delete(&service, Some(victim), "alice", vec![], 10)
+            .await
+            .unwrap();
+    }
+
+    let archived = service
+        .list(0, 100, false, true, vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(archived.len(), 2);
+    assert!(archived.iter().all(|w| w.archived_at.is_some()));
+    // It implies include_archived: the same set either way.
+    let implied = service
+        .list(0, 100, true, true, vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(implied.len(), 2);
+    assert_eq!(service.count(&[], false, true).await.unwrap(), 2);
+    assert_eq!(service.count(&[], true, true).await.unwrap(), 2);
+    // false changes nothing.
+    assert_eq!(service.count(&[], false, false).await.unwrap(), 2);
+    assert_eq!(service.count(&[], true, false).await.unwrap(), 4);
+
+    // Combines with filters, sort, skip and limit.
+    let by_id = |id: i32| FilterClause {
+        field: "id".to_string(),
+        op: FilterOp::Eq,
+        value: FilterValue::Int(i64::from(id)),
+    };
+    let one = service
+        .list(0, 100, false, true, vec![by_id(id)], vec![])
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].id, id);
+    let live = service
+        .list(0, 100, false, true, vec![by_id(all[2].id)], vec![])
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 0);
+    let sort = vec![SortClause {
+        field: "id".to_string(),
+        descending: true,
+    }];
+    let paged = service.list(1, 1, false, true, vec![], sort).await.unwrap();
+    assert_eq!(paged.len(), 1);
+    assert_eq!(paged[0].id, id.min(doomed));
+}
+
+#[tokio::test]
+async fn resolve_list_or_get_only_archived_lists_archived_and_refuses_an_id() {
+    let service = seeded().await;
+    let all = service
+        .list(0, 100, false, false, vec![], vec![])
+        .await
+        .unwrap();
+    let id = all[0].id;
+    resolve_delete(&service, Some(id), "alice", vec![], 10)
+        .await
+        .unwrap();
+
+    let ListOrGet::Many(trash) =
+        resolve_list_or_get(&service, None, 0, 10, ArchivedScope::Only, vec![], vec![])
+            .await
+            .unwrap()
+    else {
+        panic!("expected a list");
+    };
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].id, id);
+
+    let err = resolve_list_or_get(
+        &service,
+        Some(id),
+        0,
+        10,
+        ArchivedScope::Only,
+        vec![],
+        vec![],
+    )
+    .await
+    .err()
+    .unwrap();
+    let CrudError::UnprocessableEntity(errors) = err else {
+        panic!("expected 422");
+    };
+    assert_eq!(errors[0].field, "only_archived");
+    assert_eq!(errors[0].msg, "applies to list reads only");
 }
 
 dyn_repository!(
@@ -397,7 +553,7 @@ async fn dyn_repository_forwards_every_method() {
         value: FilterValue::Str(name.to_string()),
     };
 
-    assert_eq!(repo.count(&[], false).await.unwrap(), 2);
+    assert_eq!(repo.count(&[], false, false).await.unwrap(), 2);
     assert_eq!(
         repo.get(created.id, false).await.unwrap().unwrap().name,
         "a"
@@ -407,6 +563,7 @@ async fn dyn_repository_forwards_every_method() {
             skip: 0,
             limit: 10,
             include_archived: false,
+            only_archived: false,
             filters: vec![by_name("b")],
             sort: vec![],
         })
@@ -440,8 +597,12 @@ async fn a_lost_database_surfaces_as_internal_from_every_resolver() {
     let crud = CrudService::new(PgWidgets::connect().await.closed().await);
     let target = || filters(&[("quantity__min", "0")]);
 
-    assert_internal(resolve_list_or_get(&crud, Some(1), 0, 10, false, vec![], vec![]).await);
-    assert_internal(resolve_list_or_get(&crud, None, 0, 10, false, vec![], vec![]).await);
+    assert_internal(
+        resolve_list_or_get(&crud, Some(1), 0, 10, ArchivedScope::Live, vec![], vec![]).await,
+    );
+    assert_internal(
+        resolve_list_or_get(&crud, None, 0, 10, ArchivedScope::Live, vec![], vec![]).await,
+    );
     assert_internal(resolve_update(&crud, Some(1), "o", vec![], WidgetPatch::default(), 10).await);
     assert_internal(resolve_update(&crud, None, "o", target(), WidgetPatch::default(), 10).await);
     assert_internal(resolve_update_by_id(&crud, 1, "o", WidgetPatch::default()).await);
