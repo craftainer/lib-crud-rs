@@ -255,8 +255,8 @@ pub fn parse_include_archived<K: AsRef<str>, V: AsRef<str>>(
 pub fn parse_archived_scope<K: AsRef<str>, V: AsRef<str>>(
     params: &[(K, V)],
 ) -> Result<ArchivedScope, Vec<FieldError>> {
-    let include_archived = parse_include_archived(params)?;
     let only_archived = parse_only_archived(params)?;
+    let include_archived = parse_flag(params, "include_archived")?.unwrap_or(false);
     Ok(ArchivedScope::from_flags(include_archived, only_archived))
 }
 
