@@ -45,6 +45,11 @@ lists where and why. Things a host needs to know:
 - `?id=` together with filters is a `422` (Python silently ignores the
   filters; see the ADR).
 - The bulk cap is a check followed by a write, not one atomic step.
+- `only_archived=true` (a reserved key, see
+  [ADR 0006](docs/adrs/0006-only-archived-list-param.md)) narrows a list to the
+  archived rows. Call `parse_archived_scope` on the raw query for list reads and `reject_only_archived` for writes, restore and
+  `/stats`; a `Repository` implements `ListOptions::only_archived` and the
+  `only_archived` argument of `count`.
 - Event streams use server-minted, per-resource subscriber ids, cap the
   streams that start without one, answer `503` when the broker is down and
   `429` over the cap. Pass `EventBus::with_subscriber_secret` the same secret on

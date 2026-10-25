@@ -23,6 +23,10 @@ pub struct ListOptions {
     pub limit: u64,
     /// Include soft-deleted (archived) rows.
     pub include_archived: bool,
+    /// Return only archived rows (`archived_at IS NOT NULL`). Takes precedence
+    /// over `include_archived`: it implies it. Ignored by a resource with no
+    /// `archived_at`.
+    pub only_archived: bool,
     /// Conditions every returned record satisfies.
     pub filters: Vec<FilterClause>,
     /// Sort order, most significant first.
@@ -96,8 +100,10 @@ pub trait Repository: Send + Sync {
     async fn list(&self, opts: ListOptions) -> Result<Vec<Self::Model>, RepoError>;
 
     /// How many non-archived (unless `include_archived`) rows match
-    /// `filters`; used to cap a bulk update/delete before it runs. `filters`
-    /// carry the `owner_id` clause described on [`Repository`].
+    /// `filters`, or only the archived ones when `only_archived` (which takes
+    /// precedence over `include_archived`); used to cap a bulk update/delete
+    /// before it runs. `filters` carry the `owner_id` clause described on
+    /// [`Repository`].
     ///
     /// # Errors
     ///
@@ -106,6 +112,7 @@ pub trait Repository: Send + Sync {
         &self,
         filters: &[FilterClause],
         include_archived: bool,
+        only_archived: bool,
     ) -> Result<u64, RepoError>;
 
     /// Record `id`, or `None` when it does not exist.
@@ -204,8 +211,9 @@ macro_rules! dyn_repository {
                 &self,
                 filters: &[$crate::repositories::filtering::FilterClause],
                 include_archived: bool,
+                only_archived: bool,
             ) -> Result<u64, $crate::repositories::RepoError> {
-                self.0.count(filters, include_archived).await
+                self.0.count(filters, include_archived, only_archived).await
             }
 
             async fn get(

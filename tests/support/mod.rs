@@ -228,7 +228,9 @@ impl Repository for PgWidgets {
 
     async fn list(&self, opts: ListOptions) -> Result<Vec<Widget>, RepoError> {
         let mut builder = QueryBuilder::new("SELECT * FROM widgets WHERE TRUE");
-        if !opts.include_archived {
+        if opts.only_archived {
+            builder.push(" AND archived_at IS NOT NULL");
+        } else if !opts.include_archived {
             builder.push(" AND archived_at IS NULL");
         }
         push_filters(&mut builder, &opts.filters)?;
@@ -249,9 +251,12 @@ impl Repository for PgWidgets {
         &self,
         filters: &[FilterClause],
         include_archived: bool,
+        only_archived: bool,
     ) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::new("SELECT COUNT(*) FROM widgets WHERE TRUE");
-        if !include_archived {
+        if only_archived {
+            builder.push(" AND archived_at IS NOT NULL");
+        } else if !include_archived {
             builder.push(" AND archived_at IS NULL");
         }
         push_filters(&mut builder, filters)?;

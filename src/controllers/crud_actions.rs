@@ -13,8 +13,16 @@
 //! `DELETE ?id=5&status=draft` there deletes record 5 whatever its status. For
 //! a mutation that turns a guard the caller wrote into a no-op, so this crate
 //! refuses (a deliberate difference, see ADR 0003). The reserved keys
-//! (`skip`, `limit`, `sort`, `include_archived`, ...) are not filters and may
-//! accompany an `id`.
+//! (`skip`, `limit`, `sort`, `include_archived`, `only_archived`, ...) are not
+//! filters and may accompany an `id`.
+//!
+//! # `only_archived` narrows a list only
+//!
+//! [`resolve_list_or_get`] takes an [`ArchivedScope`] and refuses `Only` with an `id`
+//! (`applies to list reads only`): a single-record read would return a live
+//! row. The write resolvers take no flag; a host calls
+//! [`reject_only_archived`](crate::controllers::crud_query::reject_only_archived)
+//! on the raw query for those routes, `/stats` and restore.
 //!
 //! # The bulk cap is not atomic
 //!
@@ -36,6 +44,32 @@ use crate::repositories::Repository;
 use crate::repositories::filtering::{FilterClause, SortClause};
 use crate::views::FieldError;
 use crate::views::bulk::{BulkDeleteResult, BulkResult, BulkUpdateResult};
+
+/// Which rows a list read sees, from the `include_archived` and
+/// `only_archived` flags. `only_archived` implies `include_archived`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchivedScope {
+    /// Live rows only (the default).
+    Live,
+    /// Live and archived rows (`include_archived=true`).
+    Include,
+    /// Archived rows only (`only_archived=true`).
+    Only,
+}
+
+impl ArchivedScope {
+    /// The scope the two flags select; `only_archived` wins.
+    #[must_use]
+    pub const fn from_flags(include_archived: bool, only_archived: bool) -> Self {
+        if only_archived {
+            Self::Only
+        } else if include_archived {
+            Self::Include
+        } else {
+            Self::Live
+        }
+    }
+}
 
 /// A resolved `list`/`get`: one record (an `?id=` request) or a filtered/
 /// sorted page of them.
@@ -100,7 +134,7 @@ where
         return Err(no_target_error());
     }
     let matched = crud
-        .count(&owner_scoped(owner_id, filters.to_vec()), false)
+        .count(&owner_scoped(owner_id, filters.to_vec()), false, false) // live rows only: bulk writes never touch archived ones
         .await?;
     if matched > max_matched {
         return Err(too_many_matched_error(matched, max_matched));
@@ -135,14 +169,15 @@ fn not_found(id: i32) -> CrudError {
 /// # Errors
 ///
 /// [`CrudError::NotFound`] when `id` names no record;
-/// [`CrudError::UnprocessableEntity`] when `id` comes with filters;
+/// [`CrudError::UnprocessableEntity`] when `id` comes with filters or with
+/// `only_archived`;
 /// [`CrudError::Internal`] when the backend fails.
 pub async fn resolve_list_or_get<R>(
     crud: &CrudService<R>,
     id: Option<i32>,
     skip: u64,
     limit: u64,
-    include_archived: bool,
+    archived: ArchivedScope,
     filters: Vec<FilterClause>,
     sort: Vec<SortClause>,
 ) -> Result<ListOrGet<R::Model>, CrudError>
@@ -150,13 +185,26 @@ where
     R: Repository,
 {
     if let Some(id) = id {
+        if archived == ArchivedScope::Only {
+            return Err(CrudError::UnprocessableEntity(vec![FieldError::new(
+                "only_archived",
+                "applies to list reads only",
+            )]));
+        }
         ensure_id_without_filters(&filters)?;
-        let record = crud.get(id, include_archived).await?;
+        let record = crud.get(id, archived == ArchivedScope::Include).await?;
         let record = record.ok_or_else(|| not_found(id))?;
         return Ok(ListOrGet::One(record));
     }
     let records = crud
-        .list(skip, limit, include_archived, filters, sort)
+        .list(
+            skip,
+            limit,
+            archived == ArchivedScope::Include,
+            archived == ArchivedScope::Only,
+            filters,
+            sort,
+        )
         .await?;
     Ok(ListOrGet::Many(records))
 }
@@ -243,4 +291,20 @@ where
     check_bulk_target(crud, owner_id, &filters, max_matched).await?;
     let deleted = crud.delete_many(owner_id, filters).await?;
     Ok(DeleteOutcome::Bulk(bulk_result(&deleted)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ArchivedScope;
+
+    #[test]
+    fn the_flags_select_a_scope_and_only_archived_wins() {
+        assert_eq!(ArchivedScope::from_flags(false, false), ArchivedScope::Live);
+        assert_eq!(
+            ArchivedScope::from_flags(true, false),
+            ArchivedScope::Include
+        );
+        assert_eq!(ArchivedScope::from_flags(false, true), ArchivedScope::Only);
+        assert_eq!(ArchivedScope::from_flags(true, true), ArchivedScope::Only);
+    }
 }
