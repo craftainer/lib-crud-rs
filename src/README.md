@@ -7,7 +7,8 @@ a `repositories::Repository` per resource and composes the helpers here in
 its own routers.
 
 Modules, lowest layer first (a module imports only from those above it in
-this list, except `error`, which `conditional`, `controllers` and `events` use):
+this list, except `error`, which `conditional`, `controllers`, `events` and
+`stats_cache` use):
 
 - `models/` — `HasId`, the one model-layer contract.
 - `repositories/` — the `Repository` trait, `ListOptions`, `RepoError`,
@@ -16,6 +17,9 @@ this list, except `error`, which `conditional`, `controllers` and `events` use):
 - `crud/` — `CrudService<R>`, generic over any repository.
 - `conditional.rs` — `Versioned`, entity-tags, `If-None-Match` and `If-Match`
   helpers (imports `models` and `error`).
+- `stats_cache.rs` — the opt-in `/stats` and `/predict` response cache:
+  `StatsCache`, `MemoryStatsCache`, `CachedStats`, `cache_key` (imports `error`
+  only).
 - `events.rs` — the publish/subscribe bus (in-memory; MQTT behind the `mqtt`
   feature).
 - `error.rs` — `CrudError` and its `application/problem+json` rendering.

@@ -27,6 +27,10 @@ crate supplies the rest:
   prediction endpoints;
 - `conditional`, strong and weak `ETag`s for records and pages, `304` on
   `If-None-Match` and `412` on `If-Match` (see below);
+- `stats_cache`, an opt-in cache for stats and prediction responses:
+  `StatsCache` (async, fallible; `MemoryStatsCache` with a TTL ships), the
+  `CachedStats::get_or_build` wrapper and `cache_key` (see
+  [ADR 0010](docs/adrs/0010-stats-cache.md));
 - `events` and `controllers::crud_events`, a publish/subscribe bus and its
   Server-Sent Events stream;
 - `manifest`, the CRUD manifest (contract I1): register a
