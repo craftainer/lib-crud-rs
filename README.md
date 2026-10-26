@@ -25,6 +25,8 @@ crate supplies the rest:
   actions and a size cap;
 - `controllers::crud_stats` and `views::stats`, building blocks for stats and
   prediction endpoints;
+- `conditional`, strong and weak `ETag`s for records and pages, `304` on
+  `If-None-Match` and `412` on `If-Match` (see below);
 - `events` and `controllers::crud_events`, a publish/subscribe bus and its
   Server-Sent Events stream;
 - `manifest`, the CRUD manifest (contract I1): register a
@@ -82,6 +84,15 @@ lists where and why. Things a host needs to know:
   [ADR 0004](docs/adrs/0004-crud-manifest.md) for where it can differ from
   `lib-crud-py` (no `regex` operator, no enum or date field kinds, bulk
   event names).
+- Conditional requests are building blocks, not routes (the crate has no CRUD
+  routers): a handler computes `record_etag`/`list_etag` from `Versioned`
+  records, answers `not_modified(headers, etag)` when it returns `Some`, and
+  otherwise attaches `revalidation_headers(etag)`; a single-record `PATCH` or
+  `DELETE` calls `check_if_match` first. The tags are `lib-crud-py`'s, so the
+  SDKs behave the same. Nothing is applied automatically, so
+  `Features::conditional_requests` in the manifest stays the host's switch: set
+  it once the handlers do this. See
+  [ADR 0008](docs/adrs/0008-conditional-requests.md).
 - A repository must honour the `owner_id` equality clause that bulk actions
   append (see `Repository`).
 

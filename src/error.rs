@@ -45,6 +45,10 @@ pub enum CrudError {
     /// field (HTTP 422).
     #[error("unprocessable entity: {} field error(s)", .0.len())]
     UnprocessableEntity(Vec<FieldError>),
+    /// An `If-Match` precondition did not hold: the record changed since the
+    /// client read it (HTTP 412).
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
     /// A backing service (for example the event broker) is unavailable
     /// (HTTP 503).
     #[error("service unavailable: {0}")]
@@ -97,6 +101,11 @@ impl IntoResponse for CrudError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Unprocessable Content",
                 Detail::Fields(errors),
+            ),
+            Self::PreconditionFailed(msg) => (
+                StatusCode::PRECONDITION_FAILED,
+                "Precondition Failed",
+                Detail::Text(msg),
             ),
             Self::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,

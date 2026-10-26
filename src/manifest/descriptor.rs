@@ -158,7 +158,9 @@ pub struct Features {
     pub stats: bool,
     /// A `predict` route is mounted.
     pub predict: bool,
-    /// `ETag`, `If-None-Match` and `If-Match` are honoured.
+    /// `ETag`, `If-None-Match` and `If-Match` are honoured. The crate's
+    /// routes do not apply [`crate::conditional`] for the host, so set this
+    /// only when the host's handlers call it.
     pub conditional_requests: bool,
     /// Callers see only records they own.
     pub owner_scoped: bool,

@@ -7,20 +7,22 @@ a `repositories::Repository` per resource and composes the helpers here in
 its own routers.
 
 Modules, lowest layer first (a module imports only from those above it in
-this list, except `error`, which `controllers` and `events` use):
+this list, except `error`, which `conditional`, `controllers` and `events` use):
 
 - `models/` — `HasId`, the one model-layer contract.
 - `repositories/` — the `Repository` trait, `ListOptions`, `RepoError`,
   `dyn_repository!` and the filter/sort vocabulary.
 - `views/` — `FieldError`, bulk-result and stats/predict response shapes.
 - `crud/` — `CrudService<R>`, generic over any repository.
+- `conditional.rs` — `Versioned`, entity-tags, `If-None-Match` and `If-Match`
+  helpers (imports `models` and `error`).
 - `events.rs` — the publish/subscribe bus (in-memory; MQTT behind the `mqtt`
   feature).
 - `error.rs` — `CrudError` and its `application/problem+json` rendering.
 - `controllers/` — plain functions a resource's router composes.
 - `manifest/` — the CRUD manifest (contract I1) built from descriptors a
   host registers, its `GET <prefix>/manifest` router and the `api-catalog`
-  router. Imports `controllers::crud_query`, `crud` and `error`.
+  router. Imports `conditional`, `controllers::crud_query`, `crud` and `error`.
 
 ## Do
 
