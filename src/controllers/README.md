@@ -15,7 +15,9 @@ resource's own router composes. There is no router and no axum `State` here.
   `TimeBucket`, field-kind narrowing, the OLS `forecast` (regressed on
   bucket time, as `lib-crud-py`'s).
 - `crud_events.rs` — the resource-agnostic parts of `GET <prefix>/events`:
-  subscriber-id resolution, the SSE frame shape, `publish`.
+  subscriber-id resolution, the SSE frame shape, `publish`, and
+  `event_stream_until`, which ends the stream when a host's
+  `CancellationToken` is cancelled (graceful shutdown).
 
 ## Do
 
