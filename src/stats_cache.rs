@@ -106,6 +106,9 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
 
 /// A process-local [`StatsCache`] whose entries expire after a time to live.
 ///
+/// There is no size bound: expired entries are dropped on any `set`, when
+/// read, and on `invalidate`.
+///
 /// Meant for a single instance, tests and development; replicas behind a load
 /// balancer need a shared store, which the host supplies by implementing
 /// [`StatsCache`].
@@ -159,7 +162,11 @@ impl StatsCache for MemoryStatsCache {
     }
 
     async fn set(&self, resource: &str, key: &str, value: Value) -> Result<(), CacheError> {
-        self.entries().insert(
+        let mut entries = self.entries();
+        // Drop every expired entry first, so keys that are never read again
+        // (distinct query params) cannot pile up.
+        entries.retain(|_, (stored_at, _)| stored_at.elapsed() < self.ttl);
+        entries.insert(
             (resource.to_owned(), key.to_owned()),
             (Instant::now(), value),
         );
@@ -449,6 +456,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(cache.get("widgets", "k").await.unwrap(), None);
         assert!(cache.entries().is_empty(), "the expired entry is dropped");
+    }
+
+    #[tokio::test]
+    async fn set_drops_expired_entries_that_are_never_read_again() {
+        let cache = MemoryStatsCache::with_ttl(Duration::from_millis(20));
+        cache.set("widgets", "k1", json!(1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cache.set("widgets", "k2", json!(2)).await.unwrap();
+        let entries = cache.entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key(&("widgets".to_owned(), "k2".to_owned())));
     }
 
     #[test]

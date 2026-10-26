@@ -45,8 +45,8 @@ used):
   header from `CacheState` is the host's too.
 - Only non-per-user aggregates belong in the cache; an owner-scoped resource must pass
   `CacheScope::Owner` so owners never share an entry.
-- `MemoryStatsCache` has no size bound; expired entries are dropped when read or when the
-  resource is invalidated.
+- `MemoryStatsCache` has no size bound; expired entries are dropped on any `set`, when
+  read, and when the resource is invalidated.
 - Differences from Python: typed `Value` bodies, an explicit schema id and scope, `Bypass` as a
   state of its own (Python omits the header), and the in-memory implementation shipped here
   (Python's Redis one lives in the template).
