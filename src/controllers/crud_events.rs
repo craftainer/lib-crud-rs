@@ -17,7 +17,8 @@ use std::time::Duration;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use futures::Stream;
+use futures::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{CrudError, redacted_detail};
 use crate::events::{CrudEvent, EventAction, EventBus, EventError, EventStream};
@@ -122,7 +123,31 @@ pub async fn event_stream(
 ) -> Result<EventSse, CrudError> {
     let requested = resolve_subscriber_id(bus, resource, requested_subscriber_id, headers);
     let opened = bus.subscribe(resource, requested.as_deref()).await;
-    into_sse(opened)
+    into_sse(opened, None)
+}
+
+/// [`event_stream`] whose response body completes once `shutdown` is
+/// cancelled, so a host's graceful shutdown is not held open by a
+/// long-lived `/events` connection. A subscription opened after the token
+/// was already cancelled yields an empty, already-complete body.
+///
+/// Cancel the token when the host starts shutting down (for example in the
+/// future passed to `axum::serve(..).with_graceful_shutdown`), and clone it
+/// into each call; clones share cancellation.
+///
+/// # Errors
+///
+/// The same as [`event_stream`].
+pub async fn event_stream_until(
+    bus: &EventBus,
+    resource: &'static str,
+    requested_subscriber_id: Option<&str>,
+    headers: &HeaderMap,
+    shutdown: CancellationToken,
+) -> Result<EventSse, CrudError> {
+    let requested = resolve_subscriber_id(bus, resource, requested_subscriber_id, headers);
+    let opened = bus.subscribe(resource, requested.as_deref()).await;
+    into_sse(opened, Some(shutdown))
 }
 
 /// The CRUD error for a failed subscription. The broker's message can carry
@@ -145,14 +170,21 @@ fn subscribe_error(err: EventError) -> CrudError {
 }
 
 /// The response for a resolved subscription, or the error for a failed one.
-fn into_sse(opened: Result<(String, EventStream), EventError>) -> Result<EventSse, CrudError> {
+fn into_sse(
+    opened: Result<(String, EventStream), EventError>,
+    shutdown: Option<CancellationToken>,
+) -> Result<EventSse, CrudError> {
     let (subscriber_id, stream) = opened.map_err(subscribe_error)?;
-    Ok(sse_from(subscriber_id, stream))
+    Ok(sse_from(subscriber_id, stream, shutdown))
 }
 
 /// Wrap a resolved `EventStream` in the SSE response shape: the
 /// subscriber-id frame first, then one frame per event until the feed ends.
-fn sse_from(subscriber_id: String, stream: EventStream) -> EventSse {
+fn sse_from(
+    subscriber_id: String,
+    stream: EventStream,
+    shutdown: Option<CancellationToken>,
+) -> EventSse {
     // State: `Some(id)` until the first frame has been emitted, then `None`.
     let initial = (Some(subscriber_id.clone()), stream, subscriber_id);
     let body =
@@ -166,7 +198,13 @@ fn sse_from(subscriber_id: String, stream: EventStream) -> EventSse {
             Some((Ok(frame), (None, stream, subscriber_id)))
         });
 
-    let body: Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> = Box::pin(body);
+    let body: Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> = match shutdown {
+        // `take_until` polls the token first, so an already-cancelled token
+        // ends the body before any frame, and a cancel mid-wait drops the
+        // pending `next_event` and completes the body.
+        Some(token) => Box::pin(body.take_until(token.cancelled_owned())),
+        None => Box::pin(body),
+    };
     Sse::new(body)
         .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL))
         .into_response()
@@ -194,9 +232,12 @@ mod tests {
     fn a_failed_subscription_becomes_a_503_with_the_broker_detail_redacted() {
         let _guard = REDACTION_LOCK.lock().unwrap();
         configure_detail_redaction(true);
-        let err = into_sse(Err(EventError::Broker(
-            "tcp connect error to mqtt.internal:1883".to_string(),
-        )))
+        let err = into_sse(
+            Err(EventError::Broker(
+                "tcp connect error to mqtt.internal:1883".to_string(),
+            )),
+            None,
+        )
         .unwrap_err();
         assert!(
             matches!(&err, CrudError::ServiceUnavailable(msg) if !msg.contains("mqtt.internal")),
@@ -208,14 +249,14 @@ mod tests {
     fn the_broker_detail_is_shown_when_redaction_is_off() {
         let _guard = REDACTION_LOCK.lock().unwrap();
         configure_detail_redaction(false);
-        let err = into_sse(Err(EventError::Broker("broker down".to_string()))).unwrap_err();
+        let err = into_sse(Err(EventError::Broker("broker down".to_string())), None).unwrap_err();
         configure_detail_redaction(true);
         assert!(matches!(err, CrudError::ServiceUnavailable(msg) if msg == "broker down"));
     }
 
     #[test]
     fn hitting_the_anonymous_cap_becomes_a_429() {
-        let err = into_sse(Err(EventError::TooManyAnonymousConnections)).unwrap_err();
+        let err = into_sse(Err(EventError::TooManyAnonymousConnections), None).unwrap_err();
         assert!(matches!(err, CrudError::TooManyRequests(_)));
     }
 
@@ -390,6 +431,66 @@ mod tests {
         assert!(body.contains("event: create"), "{body}");
     }
 
+    #[tokio::test]
+    async fn an_open_stream_ends_when_the_token_is_cancelled() {
+        let bus = EventBus::mock();
+        let token = CancellationToken::new();
+        let response = event_stream_until(&bus, "widgets", None, &HeaderMap::new(), token.clone())
+            .await
+            .unwrap();
+        let canceller = async {
+            tokio::time::sleep(KEEP_ALIVE_INTERVAL * 3).await;
+            token.cancel();
+        };
+        // The bus is still alive, so only the token can end the body; the
+        // timeout turns a hang into a failure.
+        let ((), body) = tokio::join!(
+            canceller,
+            tokio::time::timeout(Duration::from_secs(2), drain(response))
+        );
+        let body = body.expect("the stream did not end after cancel");
+        assert!(body.contains("event: subscriber"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_subscription_opened_after_cancel_ends_immediately() {
+        let bus = EventBus::mock();
+        let token = CancellationToken::new();
+        token.cancel();
+        let response = event_stream_until(&bus, "widgets", None, &HeaderMap::new(), token)
+            .await
+            .unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(2), drain(response))
+            .await
+            .expect("the stream did not end");
+        assert!(body.is_empty(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_token_changes_nothing() {
+        let bus = EventBus::mock();
+        let token = CancellationToken::new();
+        let response = event_stream_until(&bus, "widgets", None, &HeaderMap::new(), token)
+            .await
+            .unwrap();
+        publish(&bus, "widgets", EventAction::Create, vec![9]).await;
+        let body = first_frames(response, 2).await;
+        assert!(body.contains("event: create"), "{body}");
+    }
+
+    /// Read a response body to its end (non-keep-alive chunks only).
+    async fn drain(response: EventSse) -> String {
+        let mut body = response.into_body().into_data_stream();
+        let mut collected = String::new();
+        while let Some(Ok(chunk)) = body.next().await {
+            let chunk = String::from_utf8_lossy(&chunk).to_string();
+            if !chunk.starts_with(':') {
+                collected.push_str(&chunk);
+            }
+        }
+        collected
+    }
+
     #[test]
     fn error_frame_logs_and_returns_a_typed_error_frame() {
         let err = serde_json::from_str::<i32>("bad").unwrap_err();
@@ -401,8 +502,6 @@ mod tests {
     /// Read up to `count` SSE frames out of a response body. Keep-alive
     /// comment frames are filtered out so a slow test never sees one.
     pub(super) async fn first_frames(response: EventSse, count: usize) -> String {
-        use futures::StreamExt;
-
         let mut body = response.into_body().into_data_stream();
         let mut collected = String::new();
         let mut seen = 0;
