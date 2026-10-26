@@ -144,7 +144,14 @@ pub async fn event_stream_until(
     headers: &HeaderMap,
     shutdown: CancellationToken,
 ) -> Result<EventSse, CrudError> {
-    open_stream(bus, resource, requested_subscriber_id, headers, Some(shutdown)).await
+    open_stream(
+        bus,
+        resource,
+        requested_subscriber_id,
+        headers,
+        Some(shutdown),
+    )
+    .await
 }
 
 async fn open_stream(
@@ -157,7 +164,10 @@ async fn open_stream(
     // After cancellation do not subscribe at all: no anonymous-connection
     // slot, no broker round trip, and no 429/503 for a client that is being
     // turned away anyway.
-    if shutdown.as_ref().is_some_and(CancellationToken::is_cancelled) {
+    if shutdown
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
         let empty: Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
             Box::pin(futures::stream::empty());
         return Ok(Sse::new(empty).into_response());
