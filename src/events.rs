@@ -668,18 +668,28 @@ impl EventBus {
     /// on disconnect", which is what [`subscribe_transient`](Self::subscribe_transient)
     /// is for).
     #[must_use]
-    pub fn with_session_ttl(mut self, ttl: Duration) -> Self {
+    pub fn with_session_ttl(self, ttl: Duration) -> Self {
         let seconds = u32::try_from(ttl.as_secs())
             .ok()
             .filter(|&seconds| seconds >= 1)
             .expect("the session TTL must be between 1 and 4294967295 seconds");
+        // Keep `mut` inside the mqtt-only block: with `mut self` in the
+        // signature, the default build warns "variable does not need to be
+        // mutable", since only the mqtt backend mutates `self`.
         #[cfg(feature = "mqtt")]
-        if let Backend::Mqtt { session_ttl, .. } = &mut self.backend {
-            *session_ttl = Some(seconds);
-        }
+        let this = {
+            let mut this = self;
+            if let Backend::Mqtt { session_ttl, .. } = &mut this.backend {
+                *session_ttl = Some(seconds);
+            }
+            this
+        };
         #[cfg(not(feature = "mqtt"))]
-        let _ = seconds;
-        self
+        let this = {
+            let _ = seconds;
+            self
+        };
+        this
     }
 
     /// Mint a subscriber id for `resource`: 128 random bits plus an HMAC tag
