@@ -121,15 +121,14 @@ pub async fn event_stream(
     requested_subscriber_id: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<EventSse, CrudError> {
-    let requested = resolve_subscriber_id(bus, resource, requested_subscriber_id, headers);
-    let opened = bus.subscribe(resource, requested.as_deref()).await;
-    into_sse(opened, None)
+    open_stream(bus, resource, requested_subscriber_id, headers, None).await
 }
 
 /// [`event_stream`] whose response body completes once `shutdown` is
 /// cancelled, so a host's graceful shutdown is not held open by a
-/// long-lived `/events` connection. A subscription opened after the token
-/// was already cancelled yields an empty, already-complete body.
+/// long-lived `/events` connection. A call made after the token was
+/// already cancelled does not subscribe and yields an empty, already-complete
+/// body (so it cannot fail with 429/503 either).
 ///
 /// Cancel the token when the host starts shutting down (for example in the
 /// future passed to `axum::serve(..).with_graceful_shutdown`), and clone it
@@ -145,9 +144,27 @@ pub async fn event_stream_until(
     headers: &HeaderMap,
     shutdown: CancellationToken,
 ) -> Result<EventSse, CrudError> {
+    open_stream(bus, resource, requested_subscriber_id, headers, Some(shutdown)).await
+}
+
+async fn open_stream(
+    bus: &EventBus,
+    resource: &'static str,
+    requested_subscriber_id: Option<&str>,
+    headers: &HeaderMap,
+    shutdown: Option<CancellationToken>,
+) -> Result<EventSse, CrudError> {
+    // After cancellation do not subscribe at all: no anonymous-connection
+    // slot, no broker round trip, and no 429/503 for a client that is being
+    // turned away anyway.
+    if shutdown.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        let empty: Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
+            Box::pin(futures::stream::empty());
+        return Ok(Sse::new(empty).into_response());
+    }
     let requested = resolve_subscriber_id(bus, resource, requested_subscriber_id, headers);
     let opened = bus.subscribe(resource, requested.as_deref()).await;
-    into_sse(opened, Some(shutdown))
+    into_sse(opened, shutdown)
 }
 
 /// The CRUD error for a failed subscription. The broker's message can carry
@@ -440,6 +457,9 @@ mod tests {
             .unwrap();
         let canceller = async {
             tokio::time::sleep(KEEP_ALIVE_INTERVAL * 3).await;
+            // Still open before the cancel: a real event is delivered.
+            publish(&bus, "widgets", EventAction::Create, vec![5]).await;
+            tokio::time::sleep(KEEP_ALIVE_INTERVAL * 3).await;
             token.cancel();
         };
         // The bus is still alive, so only the token can end the body; the
@@ -450,11 +470,16 @@ mod tests {
         );
         let body = body.expect("the stream did not end after cancel");
         assert!(body.contains("event: subscriber"), "{body}");
+        assert!(body.contains("event: create"), "{body}");
     }
 
     #[tokio::test]
     async fn a_subscription_opened_after_cancel_ends_immediately() {
-        let bus = EventBus::mock();
+        // Cap already used up: a post-cancel call must not even try to subscribe.
+        let bus = EventBus::mock().with_max_anonymous_connections(1);
+        let _held = event_stream(&bus, "widgets", None, &HeaderMap::new())
+            .await
+            .unwrap();
         let token = CancellationToken::new();
         token.cancel();
         let response = event_stream_until(&bus, "widgets", None, &HeaderMap::new(), token)
