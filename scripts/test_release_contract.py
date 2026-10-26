@@ -168,5 +168,78 @@ class VerifyPublishedProbe(unittest.TestCase):
         self.assertFalse(self.log.exists())
 
 
+# Records each call's argv (one JSON list per line) and the version Cargo.toml
+# carried at that moment.
+ORDER_CARGO = """#!/usr/bin/env python3
+import json, os, pathlib, sys
+with open(os.environ["FAKE_CARGO_LOG"], "a") as log:
+    log.write(json.dumps({"args": sys.argv[1:], "manifest": pathlib.Path("Cargo.toml").read_text()}) + "\\n")
+"""
+
+
+class StampedRelease(unittest.TestCase):
+    """A crate with dependencies must have them fetched before the offline stamp."""
+
+    def setUp(self) -> None:
+        self.work = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        self.repo = self.work / "repo"
+        (self.repo / "scripts").mkdir(parents=True)
+        for name in ("release-stamped.sh", "release-stamp-version.py"):
+            shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        (self.repo / "Cargo.toml").write_text('[package]\nname = "demo"\nversion = "0.0.0"\n')
+        (self.repo / "Cargo.lock").write_text("# lock\n")
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "cargo"
+        fake.write_text(ORDER_CARGO)
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+        self.log = self.work / "cargo.log"
+
+    def run_script(self, version: str = "1.2.3") -> subprocess.CompletedProcess[str]:
+        env = {
+            **{k: v for k, v in os.environ.items() if not k.startswith(("CARGO", "RELEASE"))},
+            "PATH": f"{self.work / 'bin'}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_CARGO_LOG": str(self.log),
+        }
+        if version:
+            env["RELEASE_VERSION"] = version
+        return subprocess.run(  # noqa: S603
+            ["bash", str(self.repo / "scripts" / "release-stamped.sh"), "cargo", "package"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=self.repo,
+            check=False,
+        )
+
+    def calls(self) -> list[dict[str, object]]:
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def test_fetches_locked_deps_before_the_offline_update(self) -> None:
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        self.assertEqual(
+            [c["args"] for c in calls],
+            [["fetch", "--locked"], ["update", "--workspace", "--offline", "--quiet"], ["package"]],
+        )
+
+    def test_fetch_runs_before_the_stamp_so_locked_still_matches(self) -> None:
+        self.assertEqual(self.run_script().returncode, 0)
+        fetch, update, package = self.calls()
+        self.assertIn('version = "0.0.0"', fetch["manifest"])
+        self.assertIn('version = "1.2.3"', update["manifest"])
+        self.assertIn('version = "1.2.3"', package["manifest"])
+
+    def test_checkout_is_restored_afterwards(self) -> None:
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertIn('version = "0.0.0"', (self.repo / "Cargo.toml").read_text())
+
+    def test_unstamped_run_leaves_the_command_alone(self) -> None:
+        self.assertEqual(self.run_script(version="").returncode, 0)
+        self.assertEqual([c["args"] for c in self.calls()], [["package"]])
+
+
 if __name__ == "__main__":
     unittest.main()

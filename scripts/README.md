@@ -33,7 +33,9 @@
   publish-packages`) runs `cargo publish` with a bootstrap token or crates.io trusted publishing,
   `release-stamped.sh` runs a command with `RELEASE_VERSION` stamped into
   `Cargo.toml`/`Cargo.lock` (restored afterwards) using
-  `release-stamp-version.py`.
+  `release-stamp-version.py`. It runs `cargo fetch --locked` first, because
+  the stamp's `cargo update --offline` needs the locked dependencies in the
+  local registry cache, which a fresh runner lacks.
 - `develop.d/`, `post-create.d/` — instance hook directories, empty apart
   from their own `README.md`; see `docs/TEMPLATE.md`'s "Instance extension
   points".
