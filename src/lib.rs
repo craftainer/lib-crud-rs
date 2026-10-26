@@ -16,6 +16,8 @@
 //! - [`events`] and [`controllers::crud_events`], a publish/subscribe bus and
 //!   its Server-Sent Events stream (the broker-backed bus is behind the
 //!   `mqtt` feature);
+//! - [`conditional`], entity-tags, `If-None-Match` revalidation and `If-Match`
+//!   preconditions;
 //! - [`manifest`], the CRUD manifest (contract I1) and the `api-catalog` that
 //!   points at it;
 //! - [`error::CrudError`], the error type all of the above return, rendered as
@@ -30,6 +32,7 @@
 //!   persistent subscriber sessions. Without it only the in-memory bus
 //!   ([`events::EventBus::mock`]) exists.
 
+pub mod conditional;
 pub mod controllers;
 pub mod crud;
 pub mod error;
