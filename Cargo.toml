@@ -40,29 +40,29 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Exact pins (`=x.y.z`), as in template-axum, so Renovate bumps them one at a
-# time.
+# Caret ranges (`x.y.z` means `^x.y.z`), not exact pins: a library must let
+# its dependents unify versions. Cargo.lock still records the exact versions.
 [dependencies]
-async-trait = "=0.1.92"
-axum = { version = "=0.8.9", default-features = false, features = ["json", "tokio"] }
-chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde", "std"] }
-futures = { version = "=0.3.34", default-features = false, features = ["std"] }
-getrandom = "=0.4.3"
-hmac = "=0.13.0"
-rumqttc = { version = "=0.25.1", default-features = false, optional = true }
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.154"
-sha2 = "=0.11.1"
-thiserror = "=2.0.21"
-tokio = { version = "=1.54.1", features = ["sync", "time"] }
-tokio-util = { version = "=0.7.20", default-features = false }
-tracing = "=0.1.44"
+async-trait = "0.1.92"
+axum = { version = "0.8.9", default-features = false, features = ["json", "tokio"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
+hmac = "0.13.0"
+rumqttc = { version = "0.25.1", default-features = false, optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
+tokio-util = { version = "0.7.20", default-features = false }
+tracing = "0.1.44"
 
 [dev-dependencies]
-jsonschema = { version = "=0.60.1", default-features = false }
-sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "derive"] }
-tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+jsonschema = { version = "0.60.1", default-features = false }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "derive"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 
 [features]
 # Off by default, like the Python package's extra: the in-memory event bus
