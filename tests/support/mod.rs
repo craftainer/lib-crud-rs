@@ -54,6 +54,9 @@ pub struct WidgetPatch {
     pub quantity: Option<i64>,
 }
 
+/// SQL excluding rows outside their publish window.
+const PUBLISHED_ONLY: &str = " AND (publish_at IS NULL OR publish_at <= now() AT TIME ZONE 'utc')";
+
 /// The columns a filter or sort may name, mapped to their SQL type.
 const COLUMNS: &[&str] = &["id", "owner_id", "name", "quantity", "created_at"];
 
@@ -94,7 +97,8 @@ impl PgWidgets {
                 name TEXT NOT NULL,
                 quantity BIGINT NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'utc'),
-                archived_at TIMESTAMP
+                archived_at TIMESTAMP,
+                publish_at TIMESTAMP
             )",
         )
         .execute(&pool)
@@ -104,6 +108,19 @@ impl PgWidgets {
             pool,
             fail_bulk_writes: false,
         }
+    }
+
+    /// Hide the widget named `name` until tomorrow (a `publish_at` in the
+    /// future), so it is outside its publish window.
+    pub async fn schedule_for_tomorrow(&self, name: &str) {
+        sqlx::query(
+            "UPDATE widgets SET publish_at = now() AT TIME ZONE 'utc' + interval '1 day' \
+             WHERE name = $1",
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .expect("schedule the widget");
     }
 
     /// Close the pool, so every later call fails like a lost database.
@@ -252,12 +269,16 @@ impl Repository for PgWidgets {
         filters: &[FilterClause],
         include_archived: bool,
         only_archived: bool,
+        include_unpublished: bool,
     ) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::new("SELECT COUNT(*) FROM widgets WHERE TRUE");
         if only_archived {
             builder.push(" AND archived_at IS NOT NULL");
         } else if !include_archived {
             builder.push(" AND archived_at IS NULL");
+        }
+        if !include_unpublished {
+            builder.push(PUBLISHED_ONLY);
         }
         push_filters(&mut builder, filters)?;
         let (count,): (i64,) = builder
@@ -346,13 +367,20 @@ impl Repository for PgWidgets {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn delete_many(&self, filters: &[FilterClause]) -> Result<Vec<Widget>, RepoError> {
+    async fn delete_many(
+        &self,
+        filters: &[FilterClause],
+        include_unpublished: bool,
+    ) -> Result<Vec<Widget>, RepoError> {
         if self.fail_bulk_writes {
             return Err(RepoError::Backend("read-only".to_string()));
         }
         let mut builder = QueryBuilder::new(
             "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc' WHERE archived_at IS NULL",
         );
+        if !include_unpublished {
+            builder.push(PUBLISHED_ONLY);
+        }
         push_filters(&mut builder, filters)?;
         builder.push(" RETURNING *");
         builder

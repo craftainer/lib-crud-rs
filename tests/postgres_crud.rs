@@ -140,7 +140,10 @@ async fn every_filter_operator_is_interpreted() {
         (FilterOp::Gt, 1),
         (FilterOp::Gte, 2),
     ] {
-        let count = service.count(&[clause(op, 7)], false, false).await.unwrap();
+        let count = service
+            .count(&[clause(op, 7)], false, false, true)
+            .await
+            .unwrap();
         assert_eq!(count, expected, "{op:?}");
     }
     let by_bool = FilterClause {
@@ -148,7 +151,10 @@ async fn every_filter_operator_is_interpreted() {
         op: FilterOp::In,
         value: FilterValue::List(vec![FilterValue::Int(-1)]),
     };
-    assert_eq!(service.count(&[by_bool], false, false).await.unwrap(), 0);
+    assert_eq!(
+        service.count(&[by_bool], false, false, true).await.unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -200,7 +206,7 @@ async fn an_unknown_column_is_a_backend_error_mapped_to_internal() {
         op: FilterOp::In,
         value: FilterValue::List(vec![FilterValue::List(vec![])]),
     };
-    assert!(service.count(&[nested], false, false).await.is_err());
+    assert!(service.count(&[nested], false, false, true).await.is_err());
 }
 
 #[tokio::test]
@@ -289,7 +295,7 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
         .err()
         .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_delete(&service, None, "alice", vec![], 10)
+    let err = resolve_delete(&service, None, "alice", vec![], 10, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
@@ -301,7 +307,7 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
         .err()
         .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_delete(&service, None, "alice", wide, 2)
+    let err = resolve_delete(&service, None, "alice", wide, 2, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
@@ -328,15 +334,20 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
         .unwrap();
     assert_eq!(bob[0].quantity, 5);
 
-    let DeleteOutcome::Bulk(result) =
-        resolve_delete(&service, None, "alice", filters(&[("quantity", "100")]), 10)
-            .await
-            .unwrap()
-    else {
+    let DeleteOutcome::Bulk(result) = resolve_delete(
+        &service,
+        None,
+        "alice",
+        filters(&[("quantity", "100")]),
+        10,
+        true,
+    )
+    .await
+    .unwrap() else {
         panic!("expected a bulk result");
     };
     assert_eq!(result.matched, 3);
-    assert_eq!(service.count(&[], false, false).await.unwrap(), 1);
+    assert_eq!(service.count(&[], false, false, true).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -385,7 +396,7 @@ async fn an_id_together_with_filters_is_refused_before_anything_runs() {
         .err()
         .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_delete(&service, Some(id), "alice", guard, 10)
+    let err = resolve_delete(&service, Some(id), "alice", guard, 10, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
@@ -404,20 +415,20 @@ async fn deleting_soft_deletes_and_hides_the_record() {
     let id = all[0].id;
 
     // Bob cannot delete alice's record.
-    let err = resolve_delete(&service, Some(id), "bob", vec![], 10)
+    let err = resolve_delete(&service, Some(id), "bob", vec![], 10, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::NotFound(_)));
 
     assert!(matches!(
-        resolve_delete(&service, Some(id), "alice", vec![], 10)
+        resolve_delete(&service, Some(id), "alice", vec![], 10, true)
             .await
             .unwrap(),
         DeleteOutcome::One
     ));
     // Already archived: a second delete finds nothing.
     assert!(matches!(
-        resolve_delete(&service, Some(id), "alice", vec![], 10)
+        resolve_delete(&service, Some(id), "alice", vec![], 10, true)
             .await
             .unwrap_err(),
         CrudError::NotFound(_)
@@ -426,8 +437,8 @@ async fn deleting_soft_deletes_and_hides_the_record() {
     assert!(service.get(id, false).await.unwrap().is_none());
     let archived = service.get(id, true).await.unwrap().unwrap();
     assert!(archived.archived_at.is_some());
-    assert_eq!(service.count(&[], false, false).await.unwrap(), 3);
-    assert_eq!(service.count(&[], true, false).await.unwrap(), 4);
+    assert_eq!(service.count(&[], false, false, true).await.unwrap(), 3);
+    assert_eq!(service.count(&[], true, false, true).await.unwrap(), 4);
     let listed = service
         .list(0, 100, true, false, vec![], vec![])
         .await
@@ -445,7 +456,7 @@ async fn only_archived_lists_and_counts_just_the_archived_rows() {
     let id = all[0].id;
     let doomed = all[1].id;
     for victim in [id, doomed] {
-        resolve_delete(&service, Some(victim), "alice", vec![], 10)
+        resolve_delete(&service, Some(victim), "alice", vec![], 10, true)
             .await
             .unwrap();
     }
@@ -462,11 +473,11 @@ async fn only_archived_lists_and_counts_just_the_archived_rows() {
         .await
         .unwrap();
     assert_eq!(implied.len(), 2);
-    assert_eq!(service.count(&[], false, true).await.unwrap(), 2);
-    assert_eq!(service.count(&[], true, true).await.unwrap(), 2);
+    assert_eq!(service.count(&[], false, true, true).await.unwrap(), 2);
+    assert_eq!(service.count(&[], true, true, true).await.unwrap(), 2);
     // false changes nothing.
-    assert_eq!(service.count(&[], false, false).await.unwrap(), 2);
-    assert_eq!(service.count(&[], true, false).await.unwrap(), 4);
+    assert_eq!(service.count(&[], false, false, true).await.unwrap(), 2);
+    assert_eq!(service.count(&[], true, false, true).await.unwrap(), 4);
 
     // Combines with filters, sort, skip and limit.
     let by_id = |id: i32| FilterClause {
@@ -502,7 +513,7 @@ async fn resolve_list_or_get_only_archived_lists_archived_and_refuses_an_id() {
         .await
         .unwrap();
     let id = all[0].id;
-    resolve_delete(&service, Some(id), "alice", vec![], 10)
+    resolve_delete(&service, Some(id), "alice", vec![], 10, true)
         .await
         .unwrap();
 
@@ -553,7 +564,7 @@ async fn dyn_repository_forwards_every_method() {
         value: FilterValue::Str(name.to_string()),
     };
 
-    assert_eq!(repo.count(&[], false, false).await.unwrap(), 2);
+    assert_eq!(repo.count(&[], false, false, true).await.unwrap(), 2);
     assert_eq!(
         repo.get(created.id, false).await.unwrap().unwrap().name,
         "a"
@@ -584,7 +595,7 @@ async fn dyn_repository_forwards_every_method() {
     assert_eq!(many.len(), 1);
 
     assert!(repo.delete(created.id, "alice").await.unwrap());
-    let deleted = repo.delete_many(&[by_name("a2")]).await.unwrap();
+    let deleted = repo.delete_many(&[by_name("a2")], true).await.unwrap();
     assert_eq!(deleted.len(), 1);
 }
 
@@ -606,8 +617,8 @@ async fn a_lost_database_surfaces_as_internal_from_every_resolver() {
     assert_internal(resolve_update(&crud, Some(1), "o", vec![], WidgetPatch::default(), 10).await);
     assert_internal(resolve_update(&crud, None, "o", target(), WidgetPatch::default(), 10).await);
     assert_internal(resolve_update_by_id(&crud, 1, "o", WidgetPatch::default()).await);
-    assert_internal(resolve_delete(&crud, Some(1), "o", vec![], 10).await);
-    assert_internal(resolve_delete(&crud, None, "o", target(), 10).await);
+    assert_internal(resolve_delete(&crud, Some(1), "o", vec![], 10, true).await);
+    assert_internal(resolve_delete(&crud, None, "o", target(), 10, true).await);
 }
 
 #[tokio::test]
@@ -617,5 +628,54 @@ async fn a_bulk_write_failing_after_the_size_check_is_internal_too() {
     let target = || filters(&[("quantity__min", "0")]);
 
     assert_internal(resolve_update(&crud, None, "o", target(), WidgetPatch::default(), 10).await);
-    assert_internal(resolve_delete(&crud, None, "o", target(), 10).await);
+    assert_internal(resolve_delete(&crud, None, "o", target(), 10, true).await);
+}
+
+#[tokio::test]
+async fn a_bulk_delete_spares_scheduled_rows_and_the_cap_counts_what_it_reaches() {
+    let repo = PgWidgets::connect().await;
+    for (name, quantity) in [("gizmo", 3), ("gadget", 7), ("Sprocket", 12)] {
+        repo.create("alice", NewWidget::new(name, quantity))
+            .await
+            .unwrap();
+    }
+    repo.schedule_for_tomorrow("gadget").await;
+    let service = CrudService::new(repo);
+    let all_alice = filters(&[("quantity__min", "0")]);
+
+    // The default (true) reaches the scheduled row, so three rows are over a cap of two.
+    let err = resolve_delete(&service, None, "alice", all_alice.clone(), 2, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::UnprocessableEntity(_)));
+
+    // `false` counts and deletes only the two published rows, so the same cap passes.
+    assert_eq!(
+        service
+            .count(&all_alice, false, false, false)
+            .await
+            .unwrap(),
+        2
+    );
+    let DeleteOutcome::Bulk(result) =
+        resolve_delete(&service, None, "alice", all_alice.clone(), 2, false)
+            .await
+            .unwrap()
+    else {
+        panic!("expected a bulk result");
+    };
+    assert_eq!(result.matched, 2);
+    assert_eq!(
+        service.count(&all_alice, false, false, true).await.unwrap(),
+        1
+    );
+
+    // Then `true` takes the scheduled row too.
+    let DeleteOutcome::Bulk(result) = resolve_delete(&service, None, "alice", all_alice, 2, true)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a bulk result");
+    };
+    assert_eq!(result.matched, 1);
 }

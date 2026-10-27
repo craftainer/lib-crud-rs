@@ -102,8 +102,10 @@ pub trait Repository: Send + Sync {
     /// How many non-archived (unless `include_archived`) rows match
     /// `filters`, or only the archived ones when `only_archived` (which takes
     /// precedence over `include_archived`); used to cap a bulk update/delete
-    /// before it runs. `filters` carry the `owner_id` clause described on
-    /// [`Repository`].
+    /// before it runs. Unless `include_unpublished`, rows outside their
+    /// publish window (not yet published, or no longer) are not counted, and
+    /// a resource with no publish window ignores the flag. `filters` carry
+    /// the `owner_id` clause described on [`Repository`].
     ///
     /// # Errors
     ///
@@ -113,6 +115,7 @@ pub trait Repository: Send + Sync {
         filters: &[FilterClause],
         include_archived: bool,
         only_archived: bool,
+        include_unpublished: bool,
     ) -> Result<u64, RepoError>;
 
     /// Record `id`, or `None` when it does not exist.
@@ -163,12 +166,19 @@ pub trait Repository: Send + Sync {
     async fn delete(&self, id: i32, owner_id: &str) -> Result<bool, RepoError>;
 
     /// Soft-delete every non-archived row matching `filters`; returns the
-    /// rows that were deleted (post-delete state).
+    /// rows that were deleted (post-delete state). With `include_unpublished`
+    /// false, rows outside their publish window are left alone (the same rows
+    /// `count` skips for that flag); a resource with no publish window ignores
+    /// it. Unlike a list read, a bulk delete defaults the flag to true.
     ///
     /// # Errors
     ///
     /// [`RepoError`] when the backend fails.
-    async fn delete_many(&self, filters: &[FilterClause]) -> Result<Vec<Self::Model>, RepoError>;
+    async fn delete_many(
+        &self,
+        filters: &[FilterClause],
+        include_unpublished: bool,
+    ) -> Result<Vec<Self::Model>, RepoError>;
 }
 
 /// A macro (not a generic blanket `impl`, which trips an async-trait/HRTB
@@ -212,8 +222,16 @@ macro_rules! dyn_repository {
                 filters: &[$crate::repositories::filtering::FilterClause],
                 include_archived: bool,
                 only_archived: bool,
+                include_unpublished: bool,
             ) -> Result<u64, $crate::repositories::RepoError> {
-                self.0.count(filters, include_archived, only_archived).await
+                self.0
+                    .count(
+                        filters,
+                        include_archived,
+                        only_archived,
+                        include_unpublished,
+                    )
+                    .await
             }
 
             async fn get(
@@ -260,8 +278,9 @@ macro_rules! dyn_repository {
             async fn delete_many(
                 &self,
                 filters: &[$crate::repositories::filtering::FilterClause],
+                include_unpublished: bool,
             ) -> Result<Vec<$model>, $crate::repositories::RepoError> {
-                self.0.delete_many(filters).await
+                self.0.delete_many(filters, include_unpublished).await
             }
         }
     };

@@ -35,8 +35,9 @@ use crate::views::FieldError;
 /// (`skip`, `limit`, `sort`, `id`, `include_archived`, `only_archived`,
 /// `include_unpublished`).
 /// `include_unpublished` is reserved even though this crate has no draft or
-/// schedule lifecycle, so a client built for the manifest can send it to any
-/// server of the family.
+/// schedule lifecycle of its own, so a client built for the manifest can send
+/// it to any server of the family. A bulk delete reads it through
+/// [`parse_bulk_delete_include_unpublished`] and hands it to the repository.
 pub const RESERVED_PARAMS: &[&str] = &[
     "id",
     "skip",
@@ -246,6 +247,22 @@ pub fn parse_include_archived<K: AsRef<str>, V: AsRef<str>>(
     Ok(parse_flag(params, "include_archived")?.unwrap_or(false))
 }
 
+/// Parse `?include_unpublished=` on a bulk `DELETE`, where an absent flag means
+/// `true`: a caller that never sends it keeps deleting rows outside their
+/// publish window, as before. `false` spares them. Same vocabulary as the other
+/// flags (`true`/`1`, `false`/`0`, case-insensitive).
+///
+/// # Errors
+///
+/// A [`FieldError`] on `include_unpublished` (`invalid filter value`) for a
+/// malformed value. A caller wraps it in
+/// [`CrudError::UnprocessableEntity`](crate::error::CrudError::UnprocessableEntity).
+pub fn parse_bulk_delete_include_unpublished<K: AsRef<str>, V: AsRef<str>>(
+    params: &[(K, V)],
+) -> Result<bool, Vec<FieldError>> {
+    Ok(parse_flag(params, "include_unpublished")?.unwrap_or(true))
+}
+
 /// The [`ArchivedScope`] a list read selects: the one call a host makes for
 /// `include_archived` and `only_archived` together.
 ///
@@ -423,6 +440,21 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn the_bulk_delete_flag_defaults_to_true_and_reads_the_shared_vocabulary() {
+        let parse = |pairs: &[(&str, &str)]| parse_bulk_delete_include_unpublished(&params(pairs));
+        assert!(parse(&[]).unwrap());
+        assert!(parse(&[("include_unpublished", "true")]).unwrap());
+        assert!(parse(&[("include_unpublished", "1")]).unwrap());
+        assert!(!parse(&[("include_unpublished", "false")]).unwrap());
+        assert!(!parse(&[("include_unpublished", " FALSE ")]).unwrap());
+        assert!(!parse(&[("include_unpublished", "0")]).unwrap());
+        let errors = parse(&[("include_unpublished", "maybe")]).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "include_unpublished");
+        assert_eq!(errors[0].msg, "invalid filter value");
     }
 
     #[test]
