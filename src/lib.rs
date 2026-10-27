@@ -13,6 +13,7 @@
 //!   decision logic, including bulk actions with a size cap;
 //! - [`controllers::crud_stats`] and [`views::stats`], the building blocks of
 //!   stats and prediction endpoints;
+//! - [`stats_cache`], an opt-in cache for stats and prediction responses;
 //! - [`events`] and [`controllers::crud_events`], a publish/subscribe bus and
 //!   its Server-Sent Events stream (the broker-backed bus is behind the
 //!   `mqtt` feature);
@@ -40,6 +41,7 @@ pub mod events;
 pub mod manifest;
 pub mod models;
 pub mod repositories;
+pub mod stats_cache;
 pub mod views;
 
 pub use async_trait;

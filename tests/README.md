@@ -15,6 +15,9 @@ a dependent would, and runs against the devcontainer's backing services.
 - `manifest_conformance.rs` — the CRUD manifest conformance fixtures through
   the builder and the route, validated against the I1 JSON Schema. Needs no
   backing service.
+- `stats_cache.rs` — the stats/predict response cache through the public API
+  (hit, miss, bypass, per-owner keys, invalidation, TTL, a failing cache).
+  Needs no backing service.
 - `fixtures/` — vendored data (the manifest contract); see its README.
 - `support/` — the shared fixtures (not a test target).
 
