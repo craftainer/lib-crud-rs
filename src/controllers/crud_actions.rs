@@ -219,10 +219,6 @@ where
 
 /// Update one record by id, or bulk-update every record matching the
 /// given filters (scoped to `owner_id`, capped by `max_matched`).
-/// `include_unpublished` applies to the bulk path only: false spares rows
-/// outside their publish window, and the cap counts the rows it selects. A
-/// host passes [`parse_bulk_delete_include_unpublished`](crate::controllers::crud_query::parse_bulk_delete_include_unpublished)
-/// (default true); a delete by id ignores it.
 ///
 /// # Errors
 ///
@@ -277,6 +273,10 @@ where
 
 /// Delete one record by id, or bulk-delete every record matching the
 /// given filters (scoped to `owner_id`, capped by `max_matched`).
+/// `include_unpublished` applies to the bulk path only: false spares rows
+/// outside their publish window, and the cap counts the rows it selects. A
+/// host passes [`parse_bulk_delete_include_unpublished`](crate::controllers::crud_query::parse_bulk_delete_include_unpublished)
+/// (default true); a delete by id ignores it.
 ///
 /// # Errors
 ///
