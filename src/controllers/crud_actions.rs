@@ -126,6 +126,7 @@ async fn check_bulk_target<R>(
     owner_id: &str,
     filters: &[FilterClause],
     max_matched: u64,
+    include_unpublished: bool,
 ) -> Result<(), CrudError>
 where
     R: Repository,
@@ -134,7 +135,14 @@ where
         return Err(no_target_error());
     }
     let matched = crud
-        .count(&owner_scoped(owner_id, filters.to_vec()), false, false) // live rows only: bulk writes never touch archived ones
+        // live rows only (bulk writes never touch archived ones), and the rows
+        // the delete will reach: the flag is the delete's own
+        .count(
+            &owner_scoped(owner_id, filters.to_vec()),
+            false,
+            false,
+            include_unpublished,
+        )
         .await?;
     if matched > max_matched {
         return Err(too_many_matched_error(matched, max_matched));
@@ -211,6 +219,10 @@ where
 
 /// Update one record by id, or bulk-update every record matching the
 /// given filters (scoped to `owner_id`, capped by `max_matched`).
+/// `include_unpublished` applies to the bulk path only: false spares rows
+/// outside their publish window, and the cap counts the rows it selects. A
+/// host passes [`parse_bulk_delete_include_unpublished`](crate::controllers::crud_query::parse_bulk_delete_include_unpublished)
+/// (default true); a delete by id ignores it.
 ///
 /// # Errors
 ///
@@ -235,7 +247,8 @@ where
         let updated = resolve_update_by_id(crud, id, owner_id, data).await?;
         return Ok(UpdateOutcome::One(updated));
     }
-    check_bulk_target(crud, owner_id, &filters, max_matched).await?;
+    // update_many has no publish-window flag: it reaches every live row
+    check_bulk_target(crud, owner_id, &filters, max_matched, true).await?;
     let updated = crud.update_many(owner_id, filters, data).await?;
     Ok(UpdateOutcome::Bulk(bulk_result(&updated)))
 }
@@ -275,6 +288,7 @@ pub async fn resolve_delete<R>(
     owner_id: &str,
     filters: Vec<FilterClause>,
     max_matched: u64,
+    include_unpublished: bool,
 ) -> Result<DeleteOutcome, CrudError>
 where
     R: Repository,
@@ -288,8 +302,10 @@ where
         }
         return Ok(DeleteOutcome::One);
     }
-    check_bulk_target(crud, owner_id, &filters, max_matched).await?;
-    let deleted = crud.delete_many(owner_id, filters).await?;
+    check_bulk_target(crud, owner_id, &filters, max_matched, include_unpublished).await?;
+    let deleted = crud
+        .delete_many(owner_id, filters, include_unpublished)
+        .await?;
     Ok(DeleteOutcome::Bulk(bulk_result(&deleted)))
 }
 

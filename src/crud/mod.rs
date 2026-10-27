@@ -55,7 +55,8 @@ where
 
     /// How many non-archived (unless `include_archived`) records match
     /// `filters`, or only the archived ones when `only_archived`; callers use
-    /// this to cap a bulk update/delete before it runs.
+    /// this to cap a bulk update/delete before it runs. `include_unpublished`
+    /// is passed to the repository (see [`Repository::count`]).
     ///
     /// # Errors
     ///
@@ -65,9 +66,15 @@ where
         filters: &[FilterClause],
         include_archived: bool,
         only_archived: bool,
+        include_unpublished: bool,
     ) -> Result<u64, RepoError> {
         self.repository
-            .count(filters, include_archived, only_archived)
+            .count(
+                filters,
+                include_archived,
+                only_archived,
+                include_unpublished,
+            )
             .await
     }
 
@@ -137,7 +144,9 @@ where
     }
 
     /// Soft-delete every non-archived record matching `filters`, scoped to
-    /// `owner_id` -- same ownership reasoning as `update_many` above.
+    /// `owner_id` -- same ownership reasoning as `update_many` above. With
+    /// `include_unpublished` false, rows outside their publish window are
+    /// spared.
     ///
     /// # Errors
     ///
@@ -146,9 +155,10 @@ where
         &self,
         owner_id: &str,
         filters: Vec<FilterClause>,
+        include_unpublished: bool,
     ) -> Result<Vec<R::Model>, RepoError> {
         self.repository
-            .delete_many(&owner_scoped(owner_id, filters))
+            .delete_many(&owner_scoped(owner_id, filters), include_unpublished)
             .await
     }
 }
@@ -177,8 +187,10 @@ mod tests {
     struct FakeRepository {
         list_opts: Mutex<Option<ListOptions>>,
         count_filters: Mutex<Option<Vec<FilterClause>>>,
+        count_include_unpublished: Mutex<Option<bool>>,
         update_many_filters: Mutex<Option<Vec<FilterClause>>>,
         delete_many_filters: Mutex<Option<Vec<FilterClause>>>,
+        delete_many_include_unpublished: Mutex<Option<bool>>,
     }
 
     #[async_trait]
@@ -197,7 +209,9 @@ mod tests {
             filters: &[FilterClause],
             _include_archived: bool,
             _only_archived: bool,
+            include_unpublished: bool,
         ) -> Result<u64, RepoError> {
+            *self.count_include_unpublished.lock().unwrap() = Some(include_unpublished);
             *self.count_filters.lock().unwrap() = Some(filters.to_vec());
             Ok(filters.len() as u64)
         }
@@ -232,7 +246,12 @@ mod tests {
             Ok(true)
         }
 
-        async fn delete_many(&self, filters: &[FilterClause]) -> Result<Vec<i32>, RepoError> {
+        async fn delete_many(
+            &self,
+            filters: &[FilterClause],
+            include_unpublished: bool,
+        ) -> Result<Vec<i32>, RepoError> {
+            *self.delete_many_include_unpublished.lock().unwrap() = Some(include_unpublished);
             *self.delete_many_filters.lock().unwrap() = Some(filters.to_vec());
             Ok(vec![1])
         }
@@ -336,7 +355,19 @@ mod tests {
             op: FilterOp::Gte,
             value: FilterValue::Int(0),
         }];
-        assert_eq!(service.count(&filters, false, false).await.unwrap(), 1);
+        assert_eq!(
+            service.count(&filters, false, false, true).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            *service.repository.count_include_unpublished.lock().unwrap(),
+            Some(true)
+        );
+        service.count(&filters, false, false, false).await.unwrap();
+        assert_eq!(
+            *service.repository.count_include_unpublished.lock().unwrap(),
+            Some(false)
+        );
     }
 
     #[tokio::test]
@@ -359,7 +390,7 @@ mod tests {
             }]
         );
 
-        service.delete_many("bob", vec![]).await.unwrap();
+        service.delete_many("bob", vec![], false).await.unwrap();
         let filters = service
             .repository
             .delete_many_filters
@@ -374,6 +405,14 @@ mod tests {
                 op: FilterOp::Eq,
                 value: FilterValue::Str("bob".to_string()),
             }]
+        );
+        assert_eq!(
+            *service
+                .repository
+                .delete_many_include_unpublished
+                .lock()
+                .unwrap(),
+            Some(false)
         );
     }
 }
