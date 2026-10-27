@@ -235,6 +235,7 @@ pub fn cache_key(
 
 /// What happened to a [`CachedStats::get_or_build`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive] // A future state (for example `Stale`) can then ship in a minor release.
 pub enum CacheState {
     /// The body came from the cache.
     Hit,
