@@ -28,7 +28,7 @@ used):
   For one instance, tests and development; a shared store is the host's own `StatsCache`.
 - `CachedStats { cache: Option<Arc<dyn StatsCache>>, resource }` with
   `get_or_build(key, build) -> Result<(Value, CacheState), E>` where `E: From<CacheError>`
-  and `build` is `FnOnce() -> impl Future<Output = Result<Value, E>>`. `CacheState` is `Hit`,
+  and `build` is `FnOnce() -> impl Future<Output = Result<Value, E>>`. `CacheState` (`#[non_exhaustive]`, so a state can be added in a minor release) is `Hit`,
   `Miss` or `Bypass` (no cache configured; `CachedStats::uncached`), with `as_str()` for an
   `X-Stats-Cache`-style header. `invalidate()` drops the resource's entries.
 - `cache_key(kind, schema_id, &CacheScope, &BTreeMap<String, Value>) -> String`: SHA-256 (hex)
