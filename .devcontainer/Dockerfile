@@ -1,10 +1,8 @@
-# syntax=docker/dockerfile:1.28
+# syntax=docker/dockerfile:1.28@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # Single-stage build: develop (the devcontainer image). Built with the repo
 # root as context (see compose.yml). The repo-root Dockerfile is reserved for
 # an instance's own runtime image -- see docs/TEMPLATE.md's "Contents" and
 # "Instance extension points".
-
-ARG DEBIAN_VERSION=trixie
 
 # renovate: datasource=github-releases depName=j178/prek
 ARG PREK_VERSION=0.5.9
@@ -51,7 +49,11 @@ ARG SSL_CERT_DIR=/etc/ssl/certs
 # this stage does install are infrastructure tooling only -- see the ARG
 # comments above.
 ########################################
-FROM mcr.microsoft.com/devcontainers/base:${DEBIAN_VERSION} AS develop
+# A literal tag plus digest, not an ARG: Renovate's dockerfile manager then
+# bumps the tag and re-pins the digest together (pinDigests in
+# .github/renovate.json). The syntax frontend on line 1 is pinned the same
+# way. Digests are of the multi-arch index (amd64 and arm64).
+FROM mcr.microsoft.com/devcontainers/base:trixie@sha256:71b6fe7c4e07ec747a94a72b2a17f2f8c286eaa7b1c59862888df764efb8b6c6 AS develop
 ARG PREK_VERSION
 ARG CLAUDE_CODE_VERSION
 ARG SNIP_VERSION
