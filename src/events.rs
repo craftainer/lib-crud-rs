@@ -862,8 +862,9 @@ struct MqttBackend {
     settings: MqttSettings,
     publisher: Mutex<Option<Publisher>>,
     /// Serialises opening the publisher so concurrent first publishes open
-    /// one connection.
-    opening: tokio::sync::Mutex<()>,
+    /// one connection. Behind `AssertUnwindSafe` because tokio's `Mutex` is
+    /// not `RefUnwindSafe` and `EventBus` was; it guards no data.
+    opening: AssertUnwindSafe<tokio::sync::Mutex<()>>,
     generations: AtomicU64,
 }
 
@@ -876,7 +877,7 @@ impl MqttBackend {
             session_ttl: Some(DEFAULT_SESSION_TTL_SECONDS),
             settings: MqttSettings::default(),
             publisher: Mutex::new(None),
-            opening: tokio::sync::Mutex::new(()),
+            opening: AssertUnwindSafe(tokio::sync::Mutex::new(())),
             generations: AtomicU64::new(0),
         }
     }

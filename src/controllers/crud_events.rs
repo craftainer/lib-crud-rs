@@ -649,7 +649,7 @@ mod tests {
     async fn an_open_stream_ends_when_the_token_is_cancelled() {
         let bus = EventBus::mock();
         let token = CancellationToken::new();
-        let response = event_stream_until(
+        let response = event_stream_until_for_caller(
             &bus,
             "widgets",
             "alice",
