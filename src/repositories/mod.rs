@@ -21,7 +21,9 @@ pub struct ListOptions {
     pub skip: u64,
     /// Maximum records to return.
     pub limit: u64,
-    /// Include soft-deleted (archived) rows.
+    /// Include soft-deleted (archived) rows, whoever owns them. Reads are not
+    /// owner-scoped, so a host decides which callers may set this (and
+    /// [`only_archived`](Self::only_archived)); the crate does not.
     pub include_archived: bool,
     /// Return only archived rows (`archived_at IS NOT NULL`). Takes precedence
     /// over `include_archived`: it implies it. Ignored by a resource with no

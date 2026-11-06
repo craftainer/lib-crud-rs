@@ -11,7 +11,12 @@ a dependent would, and runs against the devcontainer's backing services.
   (`MQTT_HOST`/`MQTT_PORT`). Needs the `mqtt` feature (`required-features`
   in `Cargo.toml`). It is the only place the persistent-session delivery
   guarantee can be verified, including the MQTT 5.0 session TTL (replay within
-  it, session gone after it, unset unchanged, transient unaffected).
+  it, session gone after it, unset unchanged, transient unaffected), the
+  default one-hour session, shutdown draining events queued on the shared
+  connection, `PendingEvents` (only a committed transaction's events arrive)
+  and the per-caller stream cap. The dev broker has no TLS listener or
+  credentials, so the TLS and login paths are covered by the unit tests in
+  `src/events.rs` (settings, file reading, a refused connection), not here.
 - `manifest_conformance.rs` — the CRUD manifest conformance fixtures through
   the builder and the route, validated against the I1 JSON Schema. Needs no
   backing service.

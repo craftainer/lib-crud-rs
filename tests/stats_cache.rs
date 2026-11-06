@@ -97,6 +97,32 @@ async fn entries_expire_after_the_ttl() {
     );
 }
 
+#[tokio::test]
+async fn the_cache_never_holds_more_than_its_cap_and_evicts_the_oldest() {
+    let memory = MemoryStatsCache::with_ttl(Duration::from_secs(30)).with_max_entries(2);
+    memory.set("widgets", "a", json!(1)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    memory.set("widgets", "b", json!(2)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    // Rewriting a stored key never evicts anything.
+    memory.set("widgets", "b", json!(3)).await.unwrap();
+    assert_eq!(memory.get("widgets", "a").await.unwrap(), Some(json!(1)));
+    // A new key at the cap evicts the entry stored longest ago ("a").
+    memory.set("widgets", "c", json!(4)).await.unwrap();
+    assert_eq!(memory.get("widgets", "a").await.unwrap(), None);
+    assert_eq!(memory.get("widgets", "b").await.unwrap(), Some(json!(3)));
+    assert_eq!(memory.get("widgets", "c").await.unwrap(), Some(json!(4)));
+}
+
+#[tokio::test]
+async fn a_cap_of_zero_is_raised_to_one() {
+    let memory = MemoryStatsCache::new().with_max_entries(0);
+    memory.set("widgets", "a", json!(1)).await.unwrap();
+    memory.set("widgets", "b", json!(2)).await.unwrap();
+    assert_eq!(memory.get("widgets", "a").await.unwrap(), None);
+    assert_eq!(memory.get("widgets", "b").await.unwrap(), Some(json!(2)));
+}
+
 /// A cache that is always down.
 struct Down;
 

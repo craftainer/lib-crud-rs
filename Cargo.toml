@@ -68,6 +68,10 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 # Off by default, like the Python package's extra: the in-memory event bus
 # needs no broker. `mqtt` adds the Mosquitto-backed bus (`EventBus::connect`).
 mqtt = ["dep:rumqttc", "tokio/rt"]
+# `mqtt-tls` adds TLS to that bus (rumqttc over rustls): `EventBus::with_mqtt_tls`.
+# Credentials work without it, but are refused over plaintext unless the host
+# opts in.
+mqtt-tls = ["mqtt", "rumqttc/use-rustls", "tokio/fs"]
 
 [lints]
 workspace = true
