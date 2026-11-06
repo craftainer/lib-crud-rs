@@ -969,7 +969,7 @@ impl MqttBackend {
 
 enum Backend {
     #[cfg(feature = "mqtt")]
-    Mqtt(MqttBackend),
+    Mqtt(Box<MqttBackend>),
     Mock(broadcast::Sender<CrudEvent>),
 }
 
@@ -1049,14 +1049,14 @@ impl EventBus {
     #[cfg(feature = "mqtt")]
     #[must_use]
     pub fn connect(host: &str, port: u16) -> Self {
-        Self::with_backend(Backend::Mqtt(MqttBackend::new(host, port)))
+        Self::with_backend(Backend::Mqtt(Box::new(MqttBackend::new(host, port))))
     }
 
     /// The MQTT side, if this is an MQTT bus.
     #[cfg(feature = "mqtt")]
     fn mqtt(&self) -> Option<&MqttBackend> {
         match &self.backend {
-            Backend::Mqtt(mqtt) => Some(mqtt),
+            Backend::Mqtt(mqtt) => Some(mqtt.as_ref()),
             Backend::Mock(_) => None,
         }
     }
@@ -1065,7 +1065,7 @@ impl EventBus {
     #[cfg(feature = "mqtt")]
     fn with_mqtt(mut self, change: impl FnOnce(&mut MqttBackend)) -> Self {
         if let Backend::Mqtt(mqtt) = &mut self.backend {
-            change(mqtt);
+            change(mqtt.as_mut());
         }
         self
     }
@@ -2957,6 +2957,15 @@ mod tests {
         assert!(
             format!("{:?}", EventBus::mock().with_mqtt_tls(MqttTls::new(&ca))).contains("mock")
         );
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    #[tokio::test]
+    async fn tls_without_client_auth_builds_a_transport_from_the_ca_alone() {
+        let ca = pem_file("ca.pem", "not a real certificate");
+        let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(MqttTls::new(&ca));
+        bus.publish(widget_event(1)).await;
+        assert_eq!(bus.delivery_stats().published, 1);
     }
 
     #[cfg(feature = "mqtt-tls")]
