@@ -985,7 +985,7 @@ pub struct EventBus {
     /// A clone of the sender is held by every publish in flight; shutdown
     /// removes this one and waits for the rest to drop.
     inflight: Mutex<Option<mpsc::Sender<()>>>,
-    drained: tokio::sync::Mutex<mpsc::Receiver<()>>,
+    drained: Mutex<Option<mpsc::Receiver<()>>>,
     published: AtomicU64,
     failed: AtomicU64,
 }
@@ -1025,7 +1025,7 @@ impl EventBus {
             max_streams_per_subscriber: Some(DEFAULT_MAX_STREAMS_PER_SUBSCRIBER),
             durable_streams: false,
             inflight: Mutex::new(Some(inflight)),
-            drained: tokio::sync::Mutex::new(drained),
+            drained: Mutex::new(Some(drained)),
             published: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         }
@@ -1408,14 +1408,20 @@ impl EventBus {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
-        let mut drained = self.drained.lock().await;
-        if tokio::time::timeout(DRAIN_TIMEOUT, drained.recv())
-            .await
-            .is_err()
-        {
+        let receiver = self
+            .drained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let drained = match receiver {
+            Some(mut receiver) => tokio::time::timeout(DRAIN_TIMEOUT, receiver.recv())
+                .await
+                .is_ok(),
+            None => true,
+        };
+        if !drained {
             tracing::warn!("event bus shutdown: publishes still in flight were not awaited");
         }
-        drop(drained);
         match &self.backend {
             #[cfg(feature = "mqtt")]
             Backend::Mqtt(mqtt) => mqtt.close().await,

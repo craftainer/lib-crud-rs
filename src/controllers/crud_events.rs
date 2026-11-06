@@ -106,6 +106,34 @@ fn error_frame(err: impl std::fmt::Display) -> SseEvent {
     SseEvent::default().event("error").data("encode failed")
 }
 
+/// The caller key of [`event_stream`] and [`event_stream_until`], which do not
+/// know who is asking: every such stream shares one budget.
+const UNSCOPED_CALLER: &str = "";
+
+/// Build the SSE response for `resource`'s event stream, for a caller the
+/// crate cannot tell apart from any other: all such streams share one
+/// per-caller budget (see [`event_stream_for_caller`], which a host with an
+/// owner scope should call instead).
+///
+/// # Errors
+///
+/// As [`event_stream_for_caller`].
+pub async fn event_stream(
+    bus: &EventBus,
+    resource: &'static str,
+    requested_subscriber_id: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<EventSse, CrudError> {
+    event_stream_for_caller(
+        bus,
+        resource,
+        UNSCOPED_CALLER,
+        requested_subscriber_id,
+        headers,
+    )
+    .await
+}
+
 /// Build the SSE response for `resource`'s event stream.
 ///
 /// `caller` identifies who is asking, for the per-caller stream limit: pass
@@ -125,7 +153,7 @@ fn error_frame(err: impl std::fmt::Display) -> SseEvent {
 /// turned redaction off), and [`CrudError::TooManyRequests`] when the bus's
 /// cap on anonymous streams, the caller's cap or the subscriber id's cap is
 /// reached.
-pub async fn event_stream(
+pub async fn event_stream_for_caller(
     bus: &EventBus,
     resource: &'static str,
     caller: &str,
@@ -157,6 +185,30 @@ pub async fn event_stream(
 ///
 /// The same as [`event_stream`].
 pub async fn event_stream_until(
+    bus: &EventBus,
+    resource: &'static str,
+    requested_subscriber_id: Option<&str>,
+    headers: &HeaderMap,
+    shutdown: CancellationToken,
+) -> Result<EventSse, CrudError> {
+    event_stream_until_for_caller(
+        bus,
+        resource,
+        UNSCOPED_CALLER,
+        requested_subscriber_id,
+        headers,
+        shutdown,
+    )
+    .await
+}
+
+/// [`event_stream_for_caller`] whose response body completes once `shutdown`
+/// is cancelled; see [`event_stream_until`].
+///
+/// # Errors
+///
+/// The same as [`event_stream_for_caller`].
+pub async fn event_stream_until_for_caller(
     bus: &EventBus,
     resource: &'static str,
     caller: &str,
@@ -408,9 +460,10 @@ mod tests {
     #[tokio::test]
     async fn a_client_chosen_id_is_replaced_by_a_minted_one() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", "alice", Some("victim"), &HeaderMap::new())
-            .await
-            .unwrap();
+        let response =
+            event_stream_for_caller(&bus, "widgets", "alice", Some("victim"), &HeaderMap::new())
+                .await
+                .unwrap();
         let body = first_frames(response, 1).await;
         assert!(!body.contains("victim"), "{body}");
         assert!(body.contains("event: subscriber"), "{body}");
@@ -421,10 +474,10 @@ mod tests {
         let bus = EventBus::mock()
             .with_durable_streams()
             .with_max_anonymous_connections(1);
-        let first = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let first = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
-        let err = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let err = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap_err();
         assert!(matches!(err, CrudError::TooManyRequests(_)));
@@ -435,7 +488,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            event_stream(&bus, "widgets", "alice", Some(&id), &HeaderMap::new())
+            event_stream_for_caller(&bus, "widgets", "alice", Some(&id), &HeaderMap::new())
                 .await
                 .is_ok()
         );
@@ -444,24 +497,53 @@ mod tests {
     #[tokio::test]
     async fn a_caller_over_its_stream_limit_gets_a_429_until_a_stream_closes() {
         let bus = EventBus::mock().with_max_streams_per_caller(Some(1));
-        let first = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let first = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
-        let err = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let err = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap_err();
         assert!(matches!(err, CrudError::TooManyRequests(_)));
         // Another caller is unaffected.
-        let _bob = event_stream(&bus, "widgets", "bob", None, &HeaderMap::new())
+        let _bob = event_stream_for_caller(&bus, "widgets", "bob", None, &HeaderMap::new())
             .await
             .unwrap();
         // Dropping the response (the client went away) frees the slot.
         drop(first);
         assert!(
-            event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+            event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn the_unscoped_entry_points_share_one_caller_budget() {
+        let bus = EventBus::mock().with_max_streams_per_caller(Some(1));
+        let first = event_stream(&bus, "widgets", None, &HeaderMap::new())
+            .await
+            .unwrap();
+        let err = event_stream(&bus, "gadgets", None, &HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CrudError::TooManyRequests(_)));
+        let err = event_stream_until(
+            &bus,
+            "widgets",
+            None,
+            &HeaderMap::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CrudError::TooManyRequests(_)));
+        // A named caller has a budget of its own.
+        assert!(
+            event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
+                .await
+                .is_ok()
+        );
+        drop(first);
     }
 
     #[tokio::test]
@@ -498,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_frame_carries_the_subscriber_id() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let response = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
         let body = first_frames(response, 1).await;
@@ -517,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn published_events_become_frames_named_after_the_action() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let response = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
         publish(&bus, "widgets", EventAction::Create, vec![42]).await;
@@ -534,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn the_stream_ends_when_the_bus_goes_away() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let response = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
         drop(bus);
@@ -548,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn keep_alive_comments_are_skipped_before_the_first_real_event() {
         let bus = EventBus::mock();
-        let response = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let response = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
         let publish_after_a_few_keep_alives = async {
@@ -599,14 +681,15 @@ mod tests {
     async fn a_subscription_opened_after_cancel_ends_immediately() {
         // Cap already used up: a post-cancel call must not even try to subscribe.
         let bus = EventBus::mock().with_max_anonymous_connections(1);
-        let _held = event_stream(&bus, "widgets", "alice", None, &HeaderMap::new())
+        let _held = event_stream_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new())
             .await
             .unwrap();
         let token = CancellationToken::new();
         token.cancel();
-        let response = event_stream_until(&bus, "widgets", "alice", None, &HeaderMap::new(), token)
-            .await
-            .unwrap();
+        let response =
+            event_stream_until_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new(), token)
+                .await
+                .unwrap();
         let body = tokio::time::timeout(Duration::from_secs(2), drain(response))
             .await
             .expect("the stream did not end");
@@ -617,9 +700,10 @@ mod tests {
     async fn an_uncancelled_token_changes_nothing() {
         let bus = EventBus::mock();
         let token = CancellationToken::new();
-        let response = event_stream_until(&bus, "widgets", "alice", None, &HeaderMap::new(), token)
-            .await
-            .unwrap();
+        let response =
+            event_stream_until_for_caller(&bus, "widgets", "alice", None, &HeaderMap::new(), token)
+                .await
+                .unwrap();
         publish(&bus, "widgets", EventAction::Create, vec![9]).await;
         let body = first_frames(response, 2).await;
         assert!(body.contains("event: create"), "{body}");

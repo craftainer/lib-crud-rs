@@ -63,8 +63,12 @@ lists where and why. Things a host needs to know:
   `/stats`; a `Repository` implements `ListOptions::only_archived` and the
   `only_archived` argument of `count`.
 - Event streams use server-minted, per-resource subscriber ids and answer
-  `503` when the broker is down. The route (`event_stream`) takes a `caller`
-  (pass the owner scope's value) and holds at most 5 streams per caller
+  `503` when the broker is down. The route (`event_stream_for_caller`, and
+  `event_stream_until_for_caller` for graceful shutdown) takes a `caller`
+  (pass the owner scope's value; `event_stream`/`event_stream_until` keep
+  their signatures and put every caller in one shared budget, so a host with
+  an owner scope should move to the `_for_caller` pair) and holds at most 5
+  streams per caller
   (`with_max_streams_per_caller`) and 2 per subscriber id
   (`with_max_streams_per_subscriber`), `429` beyond, counted per process and
   released when the stream is dropped; the streams that start without an id
