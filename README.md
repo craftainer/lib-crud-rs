@@ -28,7 +28,8 @@ crate supplies the rest:
 - `conditional`, strong and weak `ETag`s for records and pages, `304` on
   `If-None-Match` and `412` on `If-Match` (see below);
 - `stats_cache`, an opt-in cache for stats and prediction responses:
-  `StatsCache` (async, fallible; `MemoryStatsCache` with a TTL ships), the
+  `StatsCache` (async, fallible; `MemoryStatsCache` with a TTL and an entry
+  cap ships), the
   `CachedStats::get_or_build` wrapper and `cache_key` (see
   [ADR 0010](docs/adrs/0010-stats-cache.md));
 - `events` and `controllers::crud_events`, a publish/subscribe bus and its
@@ -51,37 +52,61 @@ lists where and why. Things a host needs to know:
 - `?id=` together with filters is a `422` (Python silently ignores the
   filters; see the ADR).
 - The bulk cap is a check followed by a write, not one atomic step.
+- Archived rows are the host's to gate. Reads are open, so `include_archived`
+  and `only_archived` return every owner's soft-deleted rows to any caller who
+  passes them: role-check (or ignore) the flags before calling
+  `parse_archived_scope`/`parse_only_archived`, and do not offer them to a
+  reader who should not see rows an owner deleted.
 - `only_archived=true` (a reserved key, see
   [ADR 0006](docs/adrs/0006-only-archived-list-param.md)) narrows a list to the
   archived rows. Call `parse_archived_scope` on the raw query for list reads and `reject_only_archived` for writes, restore and
   `/stats`; a `Repository` implements `ListOptions::only_archived` and the
   `only_archived` argument of `count`.
-- Event streams use server-minted, per-resource subscriber ids, cap the
-  streams that start without one, answer `503` when the broker is down and
-  `429` over the cap. Pass `EventBus::with_subscriber_secret` the same secret on
-  every instance (and across restarts) if clients should resume. Delivery
+- Event streams use server-minted, per-resource subscriber ids and answer
+  `503` when the broker is down. The route (`event_stream`) takes a `caller`
+  (pass the owner scope's value) and holds at most 5 streams per caller
+  (`with_max_streams_per_caller`) and 2 per subscriber id
+  (`with_max_streams_per_subscriber`), `429` beyond, counted per process and
+  released when the stream is dropped; the streams that start without an id
+  are still capped bus-wide. Streams are **transient** (clean session, no
+  replay, `subscriber_id`/`Last-Event-ID` ignored) unless the host builds the
+  bus `with_durable_streams()`; then pass `EventBus::with_subscriber_secret`
+  the same secret on every instance (and across restarts) if clients should
+  resume, and advertise replay in the manifest only in that case. Delivery
   covers events that reached the broker; a publish can still be dropped before
-  that (see `events`).
+  that (see `events`). See
+  [ADR 0012](docs/adrs/0012-hardened-mqtt-and-event-streams.md).
+- The MQTT connection is secured with `with_mqtt_credentials(user, password)`
+  and, with the `mqtt-tls` feature, `with_mqtt_tls(MqttTls::new(ca_file)
+  [.with_client_auth(cert, key)])`: TLS 1.2 or later, the broker verified
+  against the CA bundle and its host name (always), the files re-read for
+  each connection. Credentials without TLS are refused unless
+  `with_mqtt_allow_insecure()` (a local broker); call `EventBus::validate()`
+  at startup to fail fast. Secrets are redacted from `Debug`. The default port
+  stays 1883: pass 8883 with TLS.
+- Events are published after the commit, best effort, over one shared
+  connection: record them in a `PendingEvents` while the transaction runs
+  (mirroring SQL savepoints with `savepoint`/`rollback_to`/`release`), and
+  call `commit(&bus)` after the database commit; dropping it, or
+  `rollback()`, publishes nothing. A broker failure is logged and counted
+  (`delivery_stats()`), never a `500`; a publish that times out or is
+  cancelled discards the shared connection. Call `EventBus::shutdown()` when
+  the host stops so in-flight events drain.
 - `EventBus::subscribe_transient` connects with a clean session, so the broker
   drops the session when the connection ends (cleanly or by crash) and a
   restarting in-process consumer (a cache invalidator) orphans nothing; it is
-  never replayed to. `subscribe` stays durable, and the HTTP events route only
-  uses `subscribe`. Use `None` for the id: a clean-session connect under an id a
-  durable subscriber uses discards that subscriber's session. Production
-  brokers should also set a finite persistent-session expiry, sized to the
-  longest SSE replay window clients need (Mosquitto's
-  `persistent_client_expiration 1h`; Mosquitto never expires by default, EMQX
-  defaults to 2h).
-- `EventBus::with_session_ttl` bounds abandoned durable sessions on the client
-  side: durable subscribers then connect over MQTT 5.0 with Clean Start off and
-  a Session Expiry Interval of that many seconds (1 to 4294967295), so a browser
-  SSE client that never returns has its session and queued events dropped by the
-  broker after the TTL. Within the TTL a returning id is replayed as before.
-  Unset keeps MQTT 3.1.1. Transient subscribers and the publisher stay on 3.1.1,
-  and the two versions interoperate on the same topic. The broker must speak
-  MQTT 5.0 and may cap the value (Mosquitto `max_session_expiry_interval`); the
-  broker-side expiry above stays advisable as a backstop. See
-  [ADR 0007](docs/adrs/0007-durable-session-ttl.md).
+  never replayed to. `subscribe` stays durable. Use `None` for the id: a
+  clean-session connect under an id a durable subscriber uses discards that
+  subscriber's session.
+- Durable subscribers connect over MQTT 5.0 with Clean Start off and a Session
+  Expiry Interval, one hour by default (`with_session_ttl`, 1 to 4294967295
+  seconds; `without_session_ttl` returns to MQTT 3.1.1 and leaves expiry to the
+  broker, for a broker that does not speak 5.0). A browser SSE client that never
+  returns has its session and queued events dropped by the broker after the
+  TTL; within it a returning id is replayed. The broker may cap the value
+  (Mosquitto `max_session_expiry_interval`); a broker-side expiry
+  (`persistent_client_expiration 1h`) stays advisable as a backstop. See
+  [ADR 0007](docs/adrs/0007-durable-session-ttl.md) and ADR 0012.
 - The forecast regresses on bucket time (a gap in the series counts), the
   same formula as `lib-crud-py`.
 - The manifest is built from what the host registers; see
@@ -105,6 +130,9 @@ lists where and why. Things a host needs to know:
 - `mqtt` (off by default): `EventBus::connect`, an MQTT-backed bus with
   persistent subscriber sessions. Without it only the in-memory bus
   (`EventBus::mock`) exists.
+- `mqtt-tls` (off by default; implies `mqtt`): `EventBus::with_mqtt_tls` and
+  `MqttTls`, TLS over rumqttc's `use-rustls` (rustls 0.23 with the aws-lc-rs
+  provider, so the build needs a C toolchain and cmake).
 
 ## Development
 

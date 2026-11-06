@@ -23,7 +23,9 @@
 
 use std::time::Duration;
 
-use craftainer_crud::events::{CrudEvent, EventAction, EventBus, EventError, EventStream, topic};
+use craftainer_crud::events::{
+    CrudEvent, EventAction, EventBus, EventError, EventStream, PendingEvents, topic,
+};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 
 /// Long enough for a local broker round trip, short enough that a hung
@@ -54,7 +56,15 @@ fn unique_suffix() -> String {
     )
 }
 
+/// A bus that leaves session expiry to the broker (MQTT 3.1.1), the shape
+/// most tests below were written for.
 fn broker() -> EventBus {
+    default_broker().without_session_ttl()
+}
+
+/// A bus with every default: durable subscribers get an hour-long session
+/// over MQTT 5.0.
+fn default_broker() -> EventBus {
     let (host, port) = mqtt_endpoint();
     EventBus::connect(&host, port)
 }
@@ -453,5 +463,104 @@ async fn a_transient_subscriber_is_unaffected_by_the_session_ttl() {
             .await
             .is_none(),
         "a clean session is not kept, whatever the TTL"
+    );
+}
+
+#[tokio::test]
+async fn the_default_bus_keeps_a_durable_session_for_a_returning_subscriber() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = default_broker();
+    let subscriber_id = leave_one_event_queued(&bus, &resource).await;
+
+    let (resumed_id, mut second) = bus
+        .subscribe(&resource, Some(&subscriber_id))
+        .await
+        .unwrap();
+    assert_eq!(resumed_id, subscriber_id);
+    let replayed = next_within(&mut second, RECEIVE_TIMEOUT)
+        .await
+        .expect("the default one-hour session must replay what was queued");
+    assert_eq!(replayed.ids, vec![2]);
+}
+
+#[tokio::test]
+async fn events_share_one_connection_and_shutdown_drains_them() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker();
+    let (_, mut stream) = bus.subscribe(&resource, None).await.unwrap();
+    settle(&mut stream).await;
+
+    let events = (1..=20)
+        .map(|id| CrudEvent::new(&resource, EventAction::Create, vec![id]))
+        .collect();
+    bus.publish_all(events).await;
+    bus.shutdown().await;
+    assert_eq!(bus.delivery_stats().published, 20);
+    assert_eq!(bus.delivery_stats().failed, 0);
+
+    for id in 1..=20 {
+        let event = next_within(&mut stream, RECEIVE_TIMEOUT)
+            .await
+            .expect("an event queued before shutdown must reach the broker");
+        assert_eq!(event.ids, vec![id], "in order");
+    }
+    // After shutdown nothing more is accepted.
+    bus.publish(CrudEvent::new(&resource, EventAction::Create, vec![99]))
+        .await;
+    assert_eq!(bus.delivery_stats().failed, 1);
+}
+
+#[tokio::test]
+async fn only_events_of_a_committed_transaction_reach_subscribers() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker();
+    let (_, mut stream) = bus.subscribe(&resource, None).await.unwrap();
+    settle(&mut stream).await;
+    let event = |id| CrudEvent::new(&resource, EventAction::Create, vec![id]);
+
+    // A transaction that rolls back announces nothing.
+    let mut rolled_back = PendingEvents::new();
+    rolled_back.record(event(1));
+    rolled_back.rollback();
+
+    // A committed one announces what survived its savepoints, in order.
+    let mut pending = PendingEvents::new();
+    pending.record(event(2));
+    let savepoint = pending.savepoint();
+    pending.record(event(3));
+    pending.rollback_to(savepoint);
+    pending.record(event(4));
+    pending.commit(&bus).await;
+
+    for expected in [2, 4] {
+        let received = next_within(&mut stream, RECEIVE_TIMEOUT).await.unwrap();
+        assert_eq!(received.ids, vec![expected]);
+    }
+    assert!(
+        next_within(&mut stream, Duration::from_secs(1))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_route_stream_holds_a_caller_slot_until_it_is_dropped() {
+    let resource = format!("widgets-it-{}", unique_suffix());
+    let bus = broker().with_max_streams_per_caller(Some(1));
+    let (_, held) = bus
+        .subscribe_for_caller("alice", &resource, None)
+        .await
+        .unwrap();
+    let err = bus
+        .subscribe_for_caller("alice", &resource, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, EventError::TooManyStreams), "{err}");
+    drop(held);
+    assert!(
+        bus.subscribe_for_caller("alice", &resource, None)
+            .await
+            .is_ok()
     );
 }
