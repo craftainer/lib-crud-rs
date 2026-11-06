@@ -21,7 +21,8 @@ this list, except `error`, which `conditional`, `controllers`, `events` and
   `StatsCache`, `MemoryStatsCache`, `CachedStats`, `cache_key` (imports `error`
   only).
 - `events.rs` — the publish/subscribe bus (in-memory; MQTT behind the `mqtt`
-  feature).
+  feature, its TLS behind `mqtt-tls`), the per-caller stream limits and
+  `PendingEvents`, the after-commit event queue.
 - `error.rs` — `CrudError` and its `application/problem+json` rendering.
 - `controllers/` — plain functions a resource's router composes.
 - `manifest/` — the CRUD manifest (contract I1) built from descriptors a
@@ -34,7 +35,8 @@ this list, except `error`, which `conditional`, `controllers`, `events` and
   runs with `-D warnings`.
 - Keep the code free of resource-specific names, fields and sample data, in
   tests too; the fixtures are a neutral `widgets` resource.
-- Gate anything that needs a broker behind the `mqtt` feature.
+- Gate anything that needs a broker behind the `mqtt` feature, and anything
+  that needs TLS (`MqttTls`, `with_mqtt_tls`) behind `mqtt-tls`.
 
 ## Don't
 
