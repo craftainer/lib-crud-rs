@@ -60,7 +60,8 @@ dropped future) and the next publish opens a new one. `EventBus::shutdown()` sto
 events, waits for the publishes in flight, then disconnects and gives the event loop a moment to
 flush.
 
-**Event streams.** `subscribe_for_caller`, which `event_stream`/`event_stream_until` use, counts
+**Event streams.** `subscribe_for_caller`, which the `event_stream_for_caller` and
+`event_stream_until_for_caller` handlers use, counts
 open streams per caller (the owner scope's value the host passes, across resources; default 5) and
 per subscriber id (default 2: a reconnect can overlap a connection the server has not noticed is
 gone), and answers `EventError::TooManyStreams` (a `429`) beyond either. A slot is a guard owned by
@@ -82,8 +83,9 @@ whether a caller may pass `include_archived`/`only_archived` is the host's to ga
 ## Consequences
 
 A minor release with behaviour changes a host must know: the route no longer resumes unless the
-host calls `with_durable_streams()` (and then its manifest should advertise replay); `event_stream`
-and `event_stream_until` take a `caller`; durable sessions use MQTT 5.0 by default, so the broker
+host calls `with_durable_streams()` (and then its manifest should advertise replay); the existing
+`event_stream`/`event_stream_until` keep their signatures but put every caller in one shared
+budget (the `_for_caller` pair takes the caller, so the release stays source compatible); durable sessions use MQTT 5.0 by default, so the broker
 must speak it (or call `without_session_ttl()`); events can be lost on a broker failure or a crash
 between commit and publish (a client that needs completeness refetches on reconnect); and a
 host that publishes inside its transaction today should move to `PendingEvents`. The stream limits
