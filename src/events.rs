@@ -626,11 +626,9 @@ impl Drop for StreamSlot {
     fn drop(&mut self) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         for key in &self.keys {
-            if let Some(open) = counts.get_mut(key) {
-                *open -= 1;
-                if *open == 0 {
-                    counts.remove(key);
-                }
+            counts.entry(key.clone()).and_modify(|open| *open -= 1);
+            if counts.get(key) == Some(&0) {
+                counts.remove(key);
             }
         }
     }
@@ -2821,6 +2819,9 @@ mod tests {
     #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn the_mqtt_publisher_is_opened_once_and_shared() {
+        let bus = EventBus::connect("127.0.0.1", 1);
+        // Shutting down before anything was published has nothing to close.
+        bus.shutdown().await;
         let bus = EventBus::connect("127.0.0.1", 1);
         let mqtt = bus.mqtt().unwrap();
         let (_, first) = mqtt.shared_client().await.unwrap();
