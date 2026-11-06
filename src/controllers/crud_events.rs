@@ -550,7 +550,7 @@ mod tests {
     async fn only_a_durable_bus_resumes_a_presented_subscriber_id() {
         let transient = EventBus::mock();
         let issued = transient.mint_subscriber_id("widgets");
-        let response = event_stream(
+        let response = event_stream_for_caller(
             &transient,
             "widgets",
             "alice",
@@ -564,7 +564,7 @@ mod tests {
 
         let durable = EventBus::mock().with_durable_streams();
         let issued = durable.mint_subscriber_id("widgets");
-        let response = event_stream(
+        let response = event_stream_for_caller(
             &durable,
             "widgets",
             "alice",

@@ -141,6 +141,7 @@
 use std::collections::HashMap;
 #[cfg(feature = "mqtt")]
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 #[cfg(feature = "mqtt-tls")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "mqtt")]
@@ -978,14 +979,18 @@ pub struct EventBus {
     secret: Vec<u8>,
     anonymous: Arc<AtomicUsize>,
     max_anonymous: usize,
-    stream_counts: StreamCounts,
+    // `stream_counts`, `inflight` and `drained` sit behind `AssertUnwindSafe`
+    // to keep `EventBus` `RefUnwindSafe`, as it was before they existed: a
+    // panic inside one of their short critical sections leaves nothing
+    // half-updated, and every lock recovers from poisoning.
+    stream_counts: AssertUnwindSafe<StreamCounts>,
     max_streams_per_caller: Option<usize>,
     max_streams_per_subscriber: Option<usize>,
     durable_streams: bool,
     /// A clone of the sender is held by every publish in flight; shutdown
     /// removes this one and waits for the rest to drop.
-    inflight: Mutex<Option<mpsc::Sender<()>>>,
-    drained: Mutex<Option<mpsc::Receiver<()>>>,
+    inflight: AssertUnwindSafe<Mutex<Option<mpsc::Sender<()>>>>,
+    drained: AssertUnwindSafe<Mutex<Option<mpsc::Receiver<()>>>>,
     published: AtomicU64,
     failed: AtomicU64,
 }
@@ -1020,12 +1025,12 @@ impl EventBus {
             secret: random_bytes::<SECRET_BYTES>().to_vec(),
             anonymous: Arc::new(AtomicUsize::new(0)),
             max_anonymous: DEFAULT_MAX_ANONYMOUS_CONNECTIONS,
-            stream_counts: Arc::new(Mutex::new(HashMap::new())),
+            stream_counts: AssertUnwindSafe(Arc::new(Mutex::new(HashMap::new()))),
             max_streams_per_caller: Some(DEFAULT_MAX_STREAMS_PER_CALLER),
             max_streams_per_subscriber: Some(DEFAULT_MAX_STREAMS_PER_SUBSCRIBER),
             durable_streams: false,
-            inflight: Mutex::new(Some(inflight)),
-            drained: Mutex::new(Some(drained)),
+            inflight: AssertUnwindSafe(Mutex::new(Some(inflight))),
+            drained: AssertUnwindSafe(Mutex::new(Some(drained))),
             published: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         }
@@ -1313,7 +1318,7 @@ impl EventBus {
         }
         drop(counts);
         Ok(StreamSlot {
-            counts: Arc::clone(&self.stream_counts),
+            counts: Arc::clone(&self.stream_counts.0),
             keys,
         })
     }
