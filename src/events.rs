@@ -937,8 +937,11 @@ impl MqttBackend {
     /// Waiting for room in the request queue is bounded by
     /// [`PUBLISH_TIMEOUT`]; a failure, a timeout or a cancelled call discards
     /// the shared connection.
-    async fn send(&self, event: &CrudEvent) -> Result<(), String> {
-        let payload = serde_json::to_vec(event).map_err(|err| err.to_string())?;
+    async fn send(
+        &self,
+        event: &CrudEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = serde_json::to_vec(event)?;
         let (client, generation) = self.shared_client().await?;
         let mut guard = DiscardGuard {
             backend: self,
@@ -951,8 +954,8 @@ impl MqttBackend {
                 guard.armed = false;
                 Ok(())
             }
-            Ok(Err(err)) => Err(err.to_string()),
-            Err(_) => Err("timed out queueing the event for the broker".to_string()),
+            Ok(Err(err)) => Err(err.into()),
+            Err(_) => Err("timed out queueing the event for the broker".into()),
         }
     }
 
