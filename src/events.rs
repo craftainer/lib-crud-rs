@@ -57,11 +57,11 @@
 //! ## Securing the MQTT connection
 //!
 //! [`EventBus::with_mqtt_credentials`] sets a user name and password and
-//! [`EventBus::with_mqtt_tls`] (feature `mqtt-tls`, rumqttc over rustls) a
-//! [`MqttTls`]: a CA bundle that must verify the broker and its host name, and
-//! optionally a client certificate and key for mutual TLS. TLS 1.2 is the
-//! floor (rustls offers nothing older) and host name verification cannot be
-//! switched off. Credentials without TLS are refused unless
+//! [`EventBus::with_mqtt_tls`] (feature `mqtt-tls`, rumqttc over the system
+//! OpenSSL through native-tls) a [`MqttTls`]: a CA bundle that alone is
+//! trusted to verify the broker and its host name, and optionally a client
+//! certificate and key for mutual TLS. TLS 1.2 is the floor and host name
+//! verification cannot be switched off. Credentials without TLS are refused unless
 //! [`EventBus::with_mqtt_allow_insecure`] says otherwise; the check runs when
 //! a connection is opened, and [`EventBus::validate`] runs it at startup. The
 //! key files are read for every connection, so rotating them needs no restart.
@@ -669,10 +669,14 @@ impl std::fmt::Debug for Credentials {
 /// [`EventBus::with_mqtt_tls`].
 ///
 /// The files are PEM and are read for every new connection, so a rotated
-/// certificate takes effect without a restart. The CA bundle is required (to
-/// trust the system store, point it at the system bundle, for example
-/// `/etc/ssl/certs/ca-certificates.crt`). TLS 1.2 is the minimum and the
-/// broker's host name is always verified against its certificate.
+/// certificate takes effect without a restart. The CA bundle (one or more
+/// certificates) is required and is the only trust anchor: the system store
+/// is not consulted (to trust it, point the bundle at the system one, for
+/// example `/etc/ssl/certs/ca-certificates.crt`). The client key is PKCS#8
+/// PEM (`BEGIN PRIVATE KEY`). TLS 1.2 is the minimum and the broker's host
+/// name is always verified against its certificate. The feature links the
+/// system OpenSSL: building needs `pkg-config` and `libssl-dev`, running
+/// needs `libssl3`.
 #[cfg(feature = "mqtt-tls")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttTls {
@@ -774,12 +778,44 @@ impl MqttSettings {
             Some((cert, key)) => Some((read_pem(cert).await?, read_pem(key).await?)),
             None => None,
         };
-        Ok(Some(Transport::tls_with_config(TlsConfiguration::Simple {
-            ca,
-            alpn: None,
-            client_auth,
-        })))
+        let connector = build_connector(&ca, client_auth.as_ref())
+            .map_err(|err| format!("invalid TLS configuration: {err}"))?;
+        Ok(Some(Transport::tls_with_config(
+            TlsConfiguration::NativeConnector(connector),
+        )))
     }
+}
+
+/// The TLS connector for one connection: TLS 1.2 or later, the host name
+/// always verified, and only the certificates of `ca` (a PEM bundle) trusted.
+/// `client` is the PEM certificate chain and PKCS#8 PEM key to present.
+#[cfg(feature = "mqtt-tls")]
+fn build_connector(
+    ca: &[u8],
+    client: Option<&(Vec<u8>, Vec<u8>)>,
+) -> Result<native_tls::TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut builder = native_tls::TlsConnector::builder();
+    builder
+        .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+        .disable_built_in_roots(true);
+    let text = String::from_utf8_lossy(ca);
+    let mut trusted = 0;
+    // `Certificate::from_pem` reads one certificate, so split the bundle.
+    for block in text.split_inclusive(END) {
+        if block.contains(BEGIN) {
+            builder.add_root_certificate(native_tls::Certificate::from_pem(block.as_bytes())?);
+            trusted += 1;
+        }
+    }
+    if trusted == 0 {
+        return Err("the CA file holds no PEM certificate".into());
+    }
+    if let Some((cert, key)) = client {
+        builder.identity(native_tls::Identity::from_pkcs8(cert, key)?);
+    }
+    Ok(builder.build()?)
 }
 
 /// One PEM file, or why it could not be read.
@@ -2935,7 +2971,7 @@ mod tests {
     }
 
     #[cfg(feature = "mqtt-tls")]
-    fn pem_file(name: &str, contents: &str) -> PathBuf {
+    fn pem_file(name: &str, contents: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("craftainer-crud-events-{}", random_token()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
@@ -2943,12 +2979,49 @@ mod tests {
         path
     }
 
+    /// A throwaway self-signed certificate and its PKCS#8 PEM key, made when
+    /// the test runs so no key material lives in the repository.
+    #[cfg(feature = "mqtt-tls")]
+    fn self_signed() -> (Vec<u8>, Vec<u8>) {
+        use openssl::asn1::Asn1Time;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::hash::MessageDigest;
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509, X509NameBuilder};
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "test").unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        (
+            builder.build().to_pem().unwrap(),
+            key.private_key_to_pem_pkcs8().unwrap(),
+        )
+    }
+
     #[cfg(feature = "mqtt-tls")]
     #[tokio::test]
     async fn tls_credentials_and_client_auth_reach_every_connection() {
-        let ca = pem_file("ca.pem", "not a real certificate");
-        let cert = pem_file("client.pem", "not a real certificate");
-        let key = pem_file("client.key", "not a real key");
+        let (cert_pem, key_pem) = self_signed();
+        // A bundle of two certificates, with a trailing newline.
+        let bundle = [cert_pem.clone(), cert_pem.clone()].concat();
+        let ca = pem_file("ca.pem", &bundle);
+        let cert = pem_file("client.pem", &cert_pem);
+        let key = pem_file("client.key", &key_pem);
         let tls = MqttTls::new(&ca).with_client_auth(&cert, &key);
         assert_eq!(tls, tls.clone());
         let bus = EventBus::connect("127.0.0.1", 1)
@@ -2978,7 +3051,8 @@ mod tests {
     #[cfg(feature = "mqtt-tls")]
     #[tokio::test]
     async fn tls_without_client_auth_builds_a_transport_from_the_ca_alone() {
-        let ca = pem_file("ca.pem", "not a real certificate");
+        let (cert_pem, _) = self_signed();
+        let ca = pem_file("ca.pem", &cert_pem);
         let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(MqttTls::new(&ca));
         bus.publish(widget_event(1)).await;
         assert_eq!(bus.delivery_stats().published, 1);
@@ -2987,12 +3061,14 @@ mod tests {
     #[cfg(feature = "mqtt-tls")]
     #[tokio::test]
     async fn an_unreadable_tls_file_fails_closed_with_a_config_error() {
-        let ca = pem_file("ca.pem", "not a real certificate");
-        let cert = pem_file("client.pem", "not a real certificate");
+        let (cert_pem, key_pem) = self_signed();
+        let ca = pem_file("ca.pem", &cert_pem);
+        let cert = pem_file("client.pem", &cert_pem);
+        let key = pem_file("client.key", &key_pem);
         let missing = ca.with_file_name("missing.pem");
         for tls in [
             MqttTls::new(&missing),
-            MqttTls::new(&ca).with_client_auth(&missing, &cert),
+            MqttTls::new(&ca).with_client_auth(&missing, &key),
             MqttTls::new(&ca).with_client_auth(&cert, &missing),
         ] {
             let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(tls);
@@ -3003,6 +3079,34 @@ mod tests {
             );
             bus.publish(widget_event(1)).await;
             assert_eq!(bus.delivery_stats().failed, 1);
+        }
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    #[tokio::test]
+    async fn malformed_tls_material_fails_closed_with_a_config_error() {
+        let (cert_pem, key_pem) = self_signed();
+        let good_ca = pem_file("ca.pem", &cert_pem);
+        let junk = pem_file("junk.pem", b"not a certificate");
+        let truncated = pem_file(
+            "truncated.pem",
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        );
+        let key = pem_file("client.key", &key_pem);
+        for tls in [
+            // No certificate at all, a certificate that does not parse, and
+            // a client certificate or key that does not parse.
+            MqttTls::new(&junk),
+            MqttTls::new(&truncated),
+            MqttTls::new(&good_ca).with_client_auth(&junk, &key),
+            MqttTls::new(&good_ca).with_client_auth(&good_ca, &junk),
+        ] {
+            let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(tls);
+            let err = bus.subscribe("widgets", None).await.err().unwrap();
+            assert!(
+                matches!(&err, EventError::Config(msg) if msg.contains("invalid TLS configuration")),
+                "{err}"
+            );
         }
     }
 }

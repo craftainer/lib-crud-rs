@@ -32,10 +32,14 @@ stats cache:
 ## Decision
 
 **TLS and credentials.** `EventBus::with_mqtt_credentials(user, password)` and, behind the new
-`mqtt-tls` feature (`rumqttc/use-rustls`), `EventBus::with_mqtt_tls(MqttTls)`. `MqttTls::new(ca_file)`
-takes a required PEM CA bundle and, optionally, `with_client_auth(cert, key)` for mutual TLS (a
-pair, so "a key without a certificate" cannot be built). TLS 1.2 is rustls's floor and the broker's
-host name is verified against its certificate on every connection; unlike the Python
+`mqtt-tls` feature (`rumqttc/use-native-tls`, the system OpenSSL), `EventBus::with_mqtt_tls(MqttTls)`.
+`MqttTls::new(ca_file)` takes a required PEM CA bundle (one or more certificates, the only trust
+anchor: the built-in roots are disabled) and, optionally, `with_client_auth(cert, key)` for mutual
+TLS with a PEM certificate chain and a PKCS#8 PEM key (a pair, so "a key without a certificate"
+cannot be built; native-tls `Identity::from_pkcs8`, so no PKCS#12 password exists to leak). The
+connector is built by the crate with `min_protocol_version(TLS 1.2)` and handed to rumqttc as
+`TlsConfiguration::NativeConnector`; the broker's host name is verified against its certificate on
+every connection; unlike the Python
 `allow_insecure`, there is no way to switch verification off. The files are read for every
 connection, so rotation needs no restart. Credentials without TLS are refused unless
 `with_mqtt_allow_insecure()`, which relaxes only that rule. The rule runs when a connection is
@@ -90,8 +94,11 @@ must speak it (or call `without_session_ttl()`); events can be lost on a broker 
 between commit and publish (a client that needs completeness refetches on reconnect); and a
 host that publishes inside its transaction today should move to `PendingEvents`. The stream limits
 are per process, so with N workers the effective cap is N times larger, and callers a host cannot
-tell apart compete for one budget. `mqtt-tls` builds rustls with aws-lc-rs, which needs a C
-toolchain and cmake, and pulls `rustls-webpki` 0.102 and the unmaintained `rustls-pemfile` through
-`rumqttc` 0.25.1 (see the dependency note in the pull request). The dev broker has no TLS
+tell apart compete for one budget. `mqtt-tls` links the system OpenSSL: building needs `pkg-config`
+and `libssl-dev` (the devcontainer installs them in `scripts/develop.d/20-libssl.sh`) and running
+needs `libssl3`. rumqttc's `use-rustls` was tried first and rejected: `rumqttc` 0.25.1, the latest
+release, requires `rustls-webpki` 0.102.8 (five open RUSTSEC advisories) and the unmaintained
+`rustls-pemfile`, which `cargo deny` and `osv-scanner` refuse and which the repository does not
+ignore. The dev broker has no TLS
 listener or credentials, so those paths are unit-tested rather than run against Mosquitto.
 Optimistic concurrency stays a separate item.

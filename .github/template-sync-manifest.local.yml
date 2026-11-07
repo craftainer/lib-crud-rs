@@ -4,3 +4,5 @@ ignore:
   - .devcontainer/stack/
   # Temporary osv-scanner ignore for a lockfile-only advisory.
   - osv-scanner.toml
+  # OpenSSL development files for the `mqtt-tls` feature (native-tls).
+  - scripts/develop.d/20-libssl.sh

@@ -83,8 +83,9 @@ lists where and why. Things a host needs to know:
 - The MQTT connection is secured with `with_mqtt_credentials(user, password)`
   and, with the `mqtt-tls` feature, `with_mqtt_tls(MqttTls::new(ca_file)
   [.with_client_auth(cert, key)])`: TLS 1.2 or later, the broker verified
-  against the CA bundle and its host name (always), the files re-read for
-  each connection. Credentials without TLS are refused unless
+  against the CA bundle (the only trust anchor; PEM, one or more
+  certificates) and its host name (always), the files re-read for each
+  connection; the client key is PKCS#8 PEM. Credentials without TLS are refused unless
   `with_mqtt_allow_insecure()` (a local broker); call `EventBus::validate()`
   at startup to fail fast. Secrets are redacted from `Debug`. The default port
   stays 1883: pass 8883 with TLS.
@@ -135,8 +136,8 @@ lists where and why. Things a host needs to know:
   persistent subscriber sessions. Without it only the in-memory bus
   (`EventBus::mock`) exists.
 - `mqtt-tls` (off by default; implies `mqtt`): `EventBus::with_mqtt_tls` and
-  `MqttTls`, TLS over rumqttc's `use-rustls` (rustls 0.23 with the aws-lc-rs
-  provider, so the build needs a C toolchain and cmake).
+  `MqttTls`, TLS over rumqttc's `use-native-tls` (the system OpenSSL): the
+  build needs `pkg-config` and `libssl-dev`, a runtime image needs `libssl3`.
 
 ## Development
 
