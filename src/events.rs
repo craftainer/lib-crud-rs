@@ -673,7 +673,7 @@ impl std::fmt::Debug for Credentials {
 /// certificates) is required and is the only trust anchor: the system store
 /// is not consulted (to trust it, point the bundle at the system one, for
 /// example `/etc/ssl/certs/ca-certificates.crt`). The client key is PKCS#8
-/// PEM (`BEGIN PRIVATE KEY`). TLS 1.2 is the minimum and the broker's host
+/// PEM (the unencrypted PKCS#8 form). TLS 1.2 is the minimum and the broker's host
 /// name is always verified against its certificate. The feature links the
 /// system OpenSSL: building needs `pkg-config` and `libssl-dev`, running
 /// needs `libssl3`.
