@@ -1909,9 +1909,13 @@ mod tests {
 
     /// A fresh random secret, so no credential is a literal in the tests.
     fn random_secret() -> String {
+        use std::fmt::Write as _;
         let mut bytes = [0u8; 20];
         getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        bytes.iter().fold(String::new(), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
     }
 
     #[test]
