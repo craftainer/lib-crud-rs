@@ -64,7 +64,7 @@
 //! verification cannot be switched off. Credentials without TLS are refused unless
 //! [`EventBus::with_mqtt_allow_insecure`] says otherwise; the check runs when
 //! a connection is opened, and [`EventBus::validate`] runs it at startup. The
-//! key files are read for every connection, so rotating them needs no restart.
+//! key files are read each time a connection is opened, so rotating them needs no restart.
 //! Secrets are redacted from `Debug` output.
 //!
 //! ## Delivery (MQTT bus)
@@ -668,8 +668,10 @@ impl std::fmt::Debug for Credentials {
 /// client certificate to present: the options of
 /// [`EventBus::with_mqtt_tls`].
 ///
-/// The files are PEM and are read for every new connection, so a rotated
-/// certificate takes effect without a restart. The CA bundle (one or more
+/// The files are PEM and are read each time the bus opens a connection (a
+/// new publisher or subscriber), so a rotated certificate takes effect for
+/// those without a restart; the automatic reconnects of a connection that
+/// is already open keep the certificates it was opened with. The CA bundle (one or more
 /// certificates) is required and is the only trust anchor: the system store
 /// is not consulted (to trust it, point the bundle at the system one, for
 /// example `/etc/ssl/certs/ca-certificates.crt`). The client key is PKCS#8
@@ -1671,8 +1673,12 @@ async fn open_mqtt(
 #[derive(Debug, Default)]
 pub struct PendingEvents {
     events: Vec<CrudEvent>,
-    /// The number of events recorded when each open savepoint was taken.
-    marks: Vec<usize>,
+    /// The id and the number of events recorded when each open savepoint was
+    /// taken.
+    marks: Vec<(u64, usize)>,
+    /// The id of the next savepoint, so a stale handle never matches a newer
+    /// savepoint that reuses its depth.
+    next_id: u64,
 }
 
 /// A position in a [`PendingEvents`], returned by
@@ -1680,6 +1686,7 @@ pub struct PendingEvents {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Savepoint {
     depth: usize,
+    id: u64,
 }
 
 impl PendingEvents {
@@ -1702,9 +1709,12 @@ impl PendingEvents {
 
     /// Mirror `SAVEPOINT`: remember where the queue stands.
     pub fn savepoint(&mut self) -> Savepoint {
-        self.marks.push(self.events.len());
+        let id = self.next_id;
+        self.next_id += 1;
+        self.marks.push((id, self.events.len()));
         Savepoint {
             depth: self.marks.len() - 1,
+            id,
         }
     }
 
@@ -1712,17 +1722,26 @@ impl PendingEvents {
     /// gone, and their events stay in the transaction. A savepoint that is
     /// already gone changes nothing.
     pub fn release(&mut self, savepoint: Savepoint) {
-        self.marks.truncate(savepoint.depth);
+        if self.is_open(savepoint) {
+            self.marks.truncate(savepoint.depth);
+        }
     }
 
     /// Mirror `ROLLBACK TO SAVEPOINT`: drop the events recorded since the
     /// savepoint. Savepoints taken after it are gone; it stays usable, as in
     /// SQL. A savepoint that is already gone changes nothing.
     pub fn rollback_to(&mut self, savepoint: Savepoint) {
-        if let Some(&mark) = self.marks.get(savepoint.depth) {
-            self.events.truncate(mark);
+        if self.is_open(savepoint) {
+            self.events.truncate(self.marks[savepoint.depth].1);
             self.marks.truncate(savepoint.depth + 1);
         }
+    }
+
+    /// Whether `savepoint` is still the savepoint it was taken as.
+    fn is_open(&self, savepoint: Savepoint) -> bool {
+        self.marks
+            .get(savepoint.depth)
+            .is_some_and(|&(id, _)| id == savepoint.id)
     }
 
     /// The transaction rolled back: discard every event. (Dropping the value
@@ -1733,6 +1752,11 @@ impl PendingEvents {
 
     /// The outermost commit succeeded: publish every event, in order, with
     /// [`EventBus::publish_all`]. Open savepoints are part of the commit.
+    ///
+    /// Delivery runs inside the returned future, so a future that is dropped
+    /// part way (a client disconnect cancelling the handler) loses the events
+    /// not yet sent. A host that must deliver every event should run this in
+    /// a spawned task.
     pub async fn commit(self, bus: &EventBus) {
         bus.publish_all(self.events).await;
     }
@@ -1882,6 +1906,13 @@ impl EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh random secret, so no credential is a literal in the tests.
+    fn random_secret() -> String {
+        let mut bytes = [0u8; 20];
+        getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     #[test]
     fn topic_is_namespaced_under_the_crud_events_root() {
@@ -2807,13 +2838,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_debug_output_hides_the_secrets() {
-        let bus = EventBus::mock().with_subscriber_secret(b"s".repeat(40));
+        let secret = random_secret();
+        let bus = EventBus::mock().with_subscriber_secret(secret.clone().into_bytes());
         let shown = format!("{bus:?}");
-        assert!(
-            shown.contains("mock") && shown.contains("<redacted>"),
-            "{shown}"
-        );
-        assert!(!shown.contains(&"s".repeat(40)), "{shown}");
+        // No message: a failing assert must not print the formatted bus.
+        assert!(shown.contains("mock") && shown.contains("<redacted>"));
+        assert!(!shown.contains(&secret));
         assert!(bus.validate().is_ok());
         #[cfg(feature = "mqtt")]
         assert!(bus.mqtt().is_none());
@@ -2822,7 +2852,8 @@ mod tests {
     #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn mqtt_credentials_are_refused_without_tls_unless_allowed() {
-        let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_credentials("alice", "hunter2");
+        let password = random_secret();
+        let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_credentials("alice", &password);
         let err = bus.validate().unwrap_err();
         assert!(
             matches!(&err, EventError::Config(msg) if msg.contains("without TLS")),
@@ -2830,11 +2861,8 @@ mod tests {
         );
         // The password is redacted from Debug, the user name is not.
         let shown = format!("{bus:?}");
-        assert!(
-            shown.contains("alice") && shown.contains("<redacted>"),
-            "{shown}"
-        );
-        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("alice") && shown.contains("<redacted>"));
+        assert!(!shown.contains(&password));
         // Both ways to open a connection fail closed, and a publish is counted.
         bus.publish(widget_event(1)).await;
         assert_eq!(bus.delivery_stats().failed, 1);
@@ -2859,7 +2887,7 @@ mod tests {
     #[tokio::test]
     async fn the_mqtt_settings_are_ignored_by_the_in_memory_bus() {
         let bus = EventBus::mock()
-            .with_mqtt_credentials("alice", "hunter2")
+            .with_mqtt_credentials("alice", random_secret())
             .with_mqtt_allow_insecure()
             .without_session_ttl();
         assert!(bus.validate().is_ok());
@@ -3026,7 +3054,7 @@ mod tests {
         assert_eq!(tls, tls.clone());
         let bus = EventBus::connect("127.0.0.1", 1)
             .with_mqtt_tls(tls)
-            .with_mqtt_credentials("alice", "hunter2");
+            .with_mqtt_credentials("alice", random_secret());
         // TLS satisfies the credentials rule.
         assert!(bus.validate().is_ok());
         // The shared publisher is built with the transport and login.
