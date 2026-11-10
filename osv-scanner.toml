@@ -1,0 +1,16 @@
+# TEMPORARY ignore (user decision 2026-11-10, expires 2027-01-09).
+#
+# RUSTSEC-2026-0459 (C SQLite CVE-2026-119375) is reported against
+# libsqlite3-sys 0.37.0, which appears in Cargo.lock only because cargo
+# locks optional dependencies reached through weak dependency features.
+# SQLite is never compiled: this crate enables only sqlx's runtime-tokio,
+# postgres, chrono and derive features, and `cargo tree -e
+# normal,build,dev --target all` shows no libsqlite3-sys or sqlx-sqlite.
+# The fixed libsqlite3-sys 0.39 is unreachable: sqlx-sqlite 0.9.0 (the
+# latest sqlx) caps it at <0.38.0.
+# Remove once a sqlx release allows libsqlite3-sys >= 0.39.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+ignoreUntil = 2027-01-09T00:00:00Z
+reason = "libsqlite3-sys 0.37.0 is in Cargo.lock only via sqlx weak optional-dependency features and is never compiled: this crate uses postgres-only sqlx (runtime-tokio, postgres, chrono, derive), and cargo tree shows no libsqlite3-sys in the normal/build/dev graph. The fix (libsqlite3-sys >= 0.39) is unreachable because sqlx-sqlite 0.9.0, the latest sqlx, caps it below 0.38. Temporary user decision 2026-11-10; remove once a sqlx release allows libsqlite3-sys >= 0.39."
