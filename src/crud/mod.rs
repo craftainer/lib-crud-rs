@@ -385,8 +385,14 @@ mod tests {
         service.update(1, "o", None, 0).await.unwrap();
         service.delete(1, "o", None).await.unwrap();
         let expected = vec![Some(version), None];
-        assert_eq!(*service.repository.update_expected.lock().unwrap(), expected);
-        assert_eq!(*service.repository.delete_expected.lock().unwrap(), expected);
+        assert_eq!(
+            *service.repository.update_expected.lock().unwrap(),
+            expected
+        );
+        assert_eq!(
+            *service.repository.delete_expected.lock().unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]
