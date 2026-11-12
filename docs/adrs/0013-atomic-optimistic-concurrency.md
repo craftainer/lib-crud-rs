@@ -31,9 +31,13 @@ one-way digest of `<id>:<updated_at>`, so it cannot itself be a SQL predicate.
   `RepoError::VersionConflict` (now `#[non_exhaustive]`), which converts to the existing
   `CrudError::PreconditionFailed` (412). Telling them apart may use a second read after the
   failed write; it only classifies, it does not guard, and a row changed between the two
-  statements can be reported as the other outcome (best effort, never a lost update).
+  statements can be reported as the other outcome (best effort, never a lost update). A
+  concurrent delete during a conditional write is a 404, not a 412, as in `lib-crud-py`.
 - An implementation moves `updated_at` on every successful write, soft delete and bulk
-  writes included, at a resolution that separates two writes.
+  writes included, strictly forward: the host's responsibility, as the crate has no backend.
+  For Postgres use `updated_at = GREATEST(now(), updated_at + interval '1 microsecond')`
+  (as `lib-crud-py` does and the test fixture's `PgWidgets` now does), so the version
+  increases even inside one transaction or when the clock has not moved or stepped back.
 - `CrudService::update`/`delete`, `resolve_update`, `resolve_update_by_id` and
   `resolve_delete` pass it through. It applies to the `?id=` path; bulk actions ignore it,
   as they ignored `If-Match`.
@@ -63,7 +67,7 @@ one-way digest of `<id>:<updated_at>`, so it cannot itself be a SQL predicate.
   documents the requirement.
 - Migration, per host: (1) add `expected_version: Option<NaiveDateTime>` to the repository's
   `update` and `delete`, add `AND updated_at = $n` (or the equivalent) to the write, set
-  `updated_at` on every write, and return `RepoError::VersionConflict` when the row exists
+  `updated_at` strictly forward on every write, and return `RepoError::VersionConflict` when the row exists
   at another version; (2) in each single-record `PATCH`/`DELETE` handler replace the
   read-`check_if_match`-write sequence with read, `expected_version(&headers, &record,
   "Name")?`, then the write with that value; (3) pass `None` wherever an unconditional write

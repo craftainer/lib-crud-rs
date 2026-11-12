@@ -352,7 +352,7 @@ impl Repository for PgWidgets {
         // is no read-then-write gap. `$5 IS NULL` is the unconditional opt-out.
         let updated = sqlx::query_as::<_, Widget>(
             "UPDATE widgets SET name = COALESCE($1, name), quantity = COALESCE($2, quantity), \
-             updated_at = clock_timestamp() AT TIME ZONE 'utc' \
+             updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') \
              WHERE id = $3 AND owner_id = $4 AND archived_at IS NULL \
              AND ($5::timestamp IS NULL OR updated_at = $5) RETURNING *",
         )
@@ -384,7 +384,7 @@ impl Repository for PgWidgets {
             .push(", name), quantity = COALESCE(")
             .push_bind(data.quantity)
             .push(
-                ", quantity), updated_at = clock_timestamp() AT TIME ZONE 'utc' \
+                ", quantity), updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') \
                  WHERE archived_at IS NULL",
             );
         push_filters(&mut builder, filters)?;
@@ -404,7 +404,7 @@ impl Repository for PgWidgets {
     ) -> Result<bool, RepoError> {
         let result = sqlx::query(
             "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc', \
-             updated_at = clock_timestamp() AT TIME ZONE 'utc' \
+             updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') \
              WHERE id = $1 AND owner_id = $2 AND archived_at IS NULL \
              AND ($3::timestamp IS NULL OR updated_at = $3)",
         )
@@ -430,7 +430,7 @@ impl Repository for PgWidgets {
         }
         let mut builder = QueryBuilder::new(
             "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc', \
-             updated_at = clock_timestamp() AT TIME ZONE 'utc' WHERE archived_at IS NULL",
+             updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') WHERE archived_at IS NULL",
         );
         if !include_unpublished {
             builder.push(PUBLISHED_ONLY);
