@@ -393,10 +393,18 @@ async fn an_id_together_with_filters_is_refused_before_anything_runs() {
     .err()
     .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_update(&service, Some(id), "alice", None, guard.clone(), patch(), 10)
-        .await
-        .err()
-        .unwrap();
+    let err = resolve_update(
+        &service,
+        Some(id),
+        "alice",
+        None,
+        guard.clone(),
+        patch(),
+        10,
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
     let err = resolve_delete(&service, Some(id), "alice", None, guard, 10, true)
         .await
@@ -617,7 +625,16 @@ async fn a_lost_database_surfaces_as_internal_from_every_resolver() {
         resolve_list_or_get(&crud, None, 0, 10, ArchivedScope::Live, vec![], vec![]).await,
     );
     assert_internal(
-        resolve_update(&crud, Some(1), "o", None, vec![], WidgetPatch::default(), 10).await,
+        resolve_update(
+            &crud,
+            Some(1),
+            "o",
+            None,
+            vec![],
+            WidgetPatch::default(),
+            10,
+        )
+        .await,
     );
     assert_internal(
         resolve_update(&crud, None, "o", None, target(), WidgetPatch::default(), 10).await,
@@ -764,9 +781,17 @@ async fn a_delete_with_a_stale_expected_version_is_a_412_and_deletes_nothing() {
         .await
         .unwrap();
 
-    let err = resolve_delete(&service, Some(widget.id), "alice", Some(stale), vec![], 10, true)
-        .await
-        .unwrap_err();
+    let err = resolve_delete(
+        &service,
+        Some(widget.id),
+        "alice",
+        Some(stale),
+        vec![],
+        10,
+        true,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, CrudError::PreconditionFailed(_)), "{err:?}");
     assert!(service.get(widget.id, false).await.unwrap().is_some());
 
@@ -901,8 +926,14 @@ async fn if_match_drives_the_write_end_to_end() {
     assert!(matches!(err, CrudError::PreconditionFailed(_)));
 
     // No header and `*`: unconditional.
-    assert_eq!(expected_version(&axum::http::HeaderMap::new(), &updated, "Widget").unwrap(), None);
-    assert_eq!(expected_version(&if_match("*"), &updated, "Widget").unwrap(), None);
+    assert_eq!(
+        expected_version(&axum::http::HeaderMap::new(), &updated, "Widget").unwrap(),
+        None
+    );
+    assert_eq!(
+        expected_version(&if_match("*"), &updated, "Widget").unwrap(),
+        None
+    );
     // A weak tag never matches.
     let weak = format!("W/{}", record_etag(&updated));
     assert!(expected_version(&if_match(&weak), &updated, "Widget").is_err());

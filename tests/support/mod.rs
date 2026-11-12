@@ -383,8 +383,10 @@ impl Repository for PgWidgets {
             .push_bind(data.name)
             .push(", name), quantity = COALESCE(")
             .push_bind(data.quantity)
-            .push(", quantity), updated_at = clock_timestamp() AT TIME ZONE 'utc' \
-                 WHERE archived_at IS NULL");
+            .push(
+                ", quantity), updated_at = clock_timestamp() AT TIME ZONE 'utc' \
+                 WHERE archived_at IS NULL",
+            );
         push_filters(&mut builder, filters)?;
         builder.push(" RETURNING *");
         builder

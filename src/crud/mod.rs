@@ -156,9 +156,7 @@ where
         owner_id: &str,
         expected_version: Option<NaiveDateTime>,
     ) -> Result<bool, RepoError> {
-        self.repository
-            .delete(id, owner_id, expected_version)
-            .await
+        self.repository.delete(id, owner_id, expected_version).await
     }
 
     /// Soft-delete every non-archived record matching `filters`, scoped to
@@ -206,8 +204,8 @@ mod tests {
         list_opts: Mutex<Option<ListOptions>>,
         count_filters: Mutex<Option<Vec<FilterClause>>>,
         count_include_unpublished: Mutex<Option<bool>>,
-        update_expected: Mutex<Option<Option<NaiveDateTime>>>,
-        delete_expected: Mutex<Option<Option<NaiveDateTime>>>,
+        update_expected: Mutex<Vec<Option<NaiveDateTime>>>,
+        delete_expected: Mutex<Vec<Option<NaiveDateTime>>>,
         update_many_filters: Mutex<Option<Vec<FilterClause>>>,
         delete_many_filters: Mutex<Option<Vec<FilterClause>>>,
         delete_many_include_unpublished: Mutex<Option<bool>>,
@@ -251,7 +249,7 @@ mod tests {
             expected_version: Option<NaiveDateTime>,
             _data: i32,
         ) -> Result<Option<i32>, RepoError> {
-            *self.update_expected.lock().unwrap() = Some(expected_version);
+            self.update_expected.lock().unwrap().push(expected_version);
             Ok(Some(id))
         }
 
@@ -270,7 +268,7 @@ mod tests {
             _owner_id: &str,
             expected_version: Option<NaiveDateTime>,
         ) -> Result<bool, RepoError> {
-            *self.delete_expected.lock().unwrap() = Some(expected_version);
+            self.delete_expected.lock().unwrap().push(expected_version);
             Ok(true)
         }
 
@@ -384,18 +382,11 @@ mod tests {
             .unwrap();
         service.update(1, "o", Some(version), 0).await.unwrap();
         service.delete(1, "o", Some(version)).await.unwrap();
-        assert_eq!(
-            *service.repository.update_expected.lock().unwrap(),
-            Some(Some(version))
-        );
-        assert_eq!(
-            *service.repository.delete_expected.lock().unwrap(),
-            Some(Some(version))
-        );
         service.update(1, "o", None, 0).await.unwrap();
         service.delete(1, "o", None).await.unwrap();
-        assert_eq!(*service.repository.update_expected.lock().unwrap(), Some(None));
-        assert_eq!(*service.repository.delete_expected.lock().unwrap(), Some(None));
+        let expected = vec![Some(version), None];
+        assert_eq!(*service.repository.update_expected.lock().unwrap(), expected);
+        assert_eq!(*service.repository.delete_expected.lock().unwrap(), expected);
     }
 
     #[tokio::test]
