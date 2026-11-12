@@ -45,3 +45,6 @@ pub mod stats_cache;
 pub mod views;
 
 pub use async_trait;
+/// Re-exported for [`dyn_repository!`], whose generated `update`/`delete` name
+/// `chrono::NaiveDateTime`.
+pub use chrono;

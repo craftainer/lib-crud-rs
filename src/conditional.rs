@@ -22,6 +22,12 @@
 //!   (or a weak one, which can never match) is [`CrudError::PreconditionFailed`],
 //!   a `412` problem response. `*` matches any existing record.
 //!
+//! - [`expected_version`]: the same `If-Match` check, turned into the
+//!   `expected_version` (`Some(updated_at)` when a tag matched, `None` for an
+//!   absent header or `*`) that a repository's `update`/`delete` checks
+//!   atomically with the write, so two writers holding the same tag cannot
+//!   both succeed (ADR 0013 in the repository's `docs/adrs/`).
+//!
 //! A typical handler:
 //!
 //! ```
@@ -218,7 +224,9 @@ pub fn not_modified(req_headers: &HeaderMap, etag: &str) -> Option<Response> {
 /// call this only once the record was found and let a missing one fall
 /// through to the write's own `404`. The check and the write are separate
 /// statements: this closes the read-modify-write window a client holds open,
-/// not a race inside the gap between them.
+/// not a race inside the gap between them. To close that gap too, use
+/// [`expected_version`] and hand its result to the repository's `update` or
+/// `delete`, which then check the version atomically with the write.
 ///
 /// # Errors
 ///
@@ -242,6 +250,42 @@ pub fn check_if_match(
             "{resource} was modified since the supplied If-Match"
         )))
     }
+}
+
+/// The `expected_version` to give a repository's `update` or `delete` for
+/// one record, from the request's `If-Match` and the record as just read.
+///
+/// The `If-Match` check is [`check_if_match`]'s (strong comparison, `W/` tags
+/// never match, a header with no matching tag is
+/// [`CrudError::PreconditionFailed`], `412`). What it returns on success:
+///
+/// - `Some(record.updated_at())` when a tag matched the record's [`record_etag`]:
+///   the write is then conditional on the row still being at that version,
+///   checked atomically by the repository;
+/// - `None` when the header is absent, or only `*` matched (any existing
+///   record): the write is unconditional, as before.
+///
+/// Typical single-record handler: read the record, `let v = expected_version(&headers,
+/// &record, "Widget")?`, then `update(id, owner, v, patch)`. A write that finds
+/// the record changed in between is a `412` too
+/// ([`RepoError::VersionConflict`](crate::repositories::RepoError::VersionConflict)).
+/// A missing record has no tag, so call this only once it was found.
+///
+/// # Errors
+///
+/// [`CrudError::PreconditionFailed`] when `If-Match` is present and matches
+/// neither the record's tag nor `*`.
+pub fn expected_version<T: Versioned>(
+    req_headers: &HeaderMap,
+    record: &T,
+    resource: &str,
+) -> Result<Option<NaiveDateTime>, CrudError> {
+    let etag = record_etag(record);
+    check_if_match(req_headers, &etag, resource)?;
+    let tag_matched = entity_tags(req_headers, &IF_MATCH)
+        .into_iter()
+        .any(|tag| tag == etag);
+    Ok(tag_matched.then(|| record.updated_at()))
 }
 
 #[cfg(test)]
@@ -493,6 +537,55 @@ mod tests {
         ));
         // `*` still matches an existing record with a weak current tag.
         assert!(check_if_match(&headers("if-match", &["*"]), &weak_current, "W").is_ok());
+    }
+
+    #[test]
+    fn expected_version_is_none_without_the_header() {
+        assert_eq!(
+            expected_version(&HeaderMap::new(), &widget(1, 0), "Widget").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn expected_version_is_the_updated_at_of_a_matching_strong_tag() {
+        let record = widget(1, 7);
+        let etag = record_etag(&record);
+        let got = expected_version(&headers("if-match", &[&etag]), &record, "Widget").unwrap();
+        assert_eq!(got, Some(record.updated_at));
+        let list = format!("\"old\", {etag}");
+        let got = expected_version(&headers("if-match", &[&list]), &record, "Widget").unwrap();
+        assert_eq!(got, Some(record.updated_at));
+    }
+
+    #[test]
+    fn expected_version_is_none_for_star() {
+        let record = widget(1, 0);
+        let got = expected_version(&headers("if-match", &["*"]), &record, "Widget").unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn expected_version_prefers_a_matching_tag_over_star() {
+        let record = widget(1, 0);
+        let both = format!("*, {}", record_etag(&record));
+        let got = expected_version(&headers("if-match", &[&both]), &record, "Widget").unwrap();
+        assert_eq!(got, Some(record.updated_at));
+    }
+
+    #[test]
+    fn expected_version_fails_with_412_on_a_stale_weak_or_empty_header() {
+        let record = widget(1, 0);
+        let weak = format!("W/{}", record_etag(&record));
+        for value in ["\"stale\"", weak.as_str(), ""] {
+            let request = headers("if-match", &[value]);
+            let err = expected_version(&request, &record, "Widget").unwrap_err();
+            assert!(
+                matches!(&err, CrudError::PreconditionFailed(msg)
+                    if msg == "Widget was modified since the supplied If-Match"),
+                "{value:?} gave {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

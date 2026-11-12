@@ -10,6 +10,7 @@
 pub mod filtering;
 
 use async_trait::async_trait;
+use chrono::NaiveDateTime;
 
 use filtering::{FilterClause, SortClause};
 
@@ -40,10 +41,18 @@ pub struct ListOptions {
 /// ownership" (both surfaced as `None`/`false` return values, not this
 /// error) from "the backend itself failed".
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RepoError {
     /// The storage backend failed.
     #[error("backend error: {0}")]
     Backend(String),
+    /// A conditional `update` or `delete` found the record, but its version
+    /// (`updated_at`) is not the `expected_version` the caller supplied: it
+    /// was changed after the caller read it. Nothing was written. Converts to
+    /// [`CrudError::PreconditionFailed`](crate::error::CrudError::PreconditionFailed)
+    /// (HTTP 412).
+    #[error("version conflict: the record was modified since it was read")]
+    VersionConflict,
 }
 
 /// Storage-agnostic CRUD access for one resource. Every mutating method
@@ -76,6 +85,26 @@ pub enum RepoError {
 /// its [`FieldSpec`](crate::controllers::crud_query::FieldSpec) table;
 /// otherwise the only `owner_id` clause a repository sees is the one the
 /// service appends.
+///
+/// # Optimistic concurrency: `expected_version`
+///
+/// A record's version is its `updated_at` (see
+/// [`Versioned`](crate::conditional::Versioned)). `update` and `delete` take
+/// an `expected_version: Option<NaiveDateTime>`:
+///
+/// - `Some(v)`: the write happens only if the row's `updated_at` is still
+///   `v`, **atomically with the write** (for SQL, one statement with
+///   `AND updated_at = $n` next to the id and owner predicates; for memory,
+///   under the lock that guards the write). The check must not be a separate
+///   read followed by a write. When no row matched, the implementation tells
+///   the two causes apart: the record is missing, not owned or archived
+///   (`Ok(None)` / `Ok(false)`, a 404), or it exists but its version differs
+///   ([`RepoError::VersionConflict`], a 412).
+/// - `None`: an explicit, unconditional write (no version predicate).
+///
+/// An implementation must also move `updated_at` on every successful write
+/// (a soft delete included), at a resolution that distinguishes two writes:
+/// the conditional write is only as sound as the version it compares.
 ///
 /// # Bulk actions are not atomic with their cap
 ///
@@ -135,15 +164,21 @@ pub trait Repository: Send + Sync {
     async fn create(&self, owner_id: &str, data: Self::Create) -> Result<Self::Model, RepoError>;
 
     /// Update record `id`; `None` if no row matched (not found or not owned
-    /// by `owner_id`).
+    /// by `owner_id`). With `expected_version` `Some(v)` the update applies
+    /// only if the row's `updated_at` is still `v`, atomically; see
+    /// "Optimistic concurrency" on [`Repository`]. `None` writes
+    /// unconditionally.
     ///
     /// # Errors
     ///
-    /// [`RepoError`] when the backend fails.
+    /// [`RepoError::VersionConflict`] when the record exists but its version
+    /// is not `expected_version`; [`RepoError::Backend`] when the backend
+    /// fails.
     async fn update(
         &self,
         id: i32,
         owner_id: &str,
+        expected_version: Option<NaiveDateTime>,
         data: Self::Update,
     ) -> Result<Option<Self::Model>, RepoError>;
 
@@ -160,12 +195,20 @@ pub trait Repository: Send + Sync {
     ) -> Result<Vec<Self::Model>, RepoError>;
 
     /// Soft-delete record `id`; `false` if no row matched (not found, not
-    /// owned, or already archived).
+    /// owned, or already archived). `expected_version` is as for
+    /// [`update`](Self::update).
     ///
     /// # Errors
     ///
-    /// [`RepoError`] when the backend fails.
-    async fn delete(&self, id: i32, owner_id: &str) -> Result<bool, RepoError>;
+    /// [`RepoError::VersionConflict`] when the record exists but its version
+    /// is not `expected_version`; [`RepoError::Backend`] when the backend
+    /// fails.
+    async fn delete(
+        &self,
+        id: i32,
+        owner_id: &str,
+        expected_version: Option<NaiveDateTime>,
+    ) -> Result<bool, RepoError>;
 
     /// Soft-delete every non-archived row matching `filters`; returns the
     /// rows that were deleted (post-delete state). With `include_unpublished`
@@ -256,9 +299,10 @@ macro_rules! dyn_repository {
                 &self,
                 id: i32,
                 owner_id: &str,
+                expected_version: Option<$crate::chrono::NaiveDateTime>,
                 data: $update,
             ) -> Result<Option<$model>, $crate::repositories::RepoError> {
-                self.0.update(id, owner_id, data).await
+                self.0.update(id, owner_id, expected_version, data).await
             }
 
             async fn update_many(
@@ -273,8 +317,9 @@ macro_rules! dyn_repository {
                 &self,
                 id: i32,
                 owner_id: &str,
+                expected_version: Option<$crate::chrono::NaiveDateTime>,
             ) -> Result<bool, $crate::repositories::RepoError> {
-                self.0.delete(id, owner_id).await
+                self.0.delete(id, owner_id, expected_version).await
             }
 
             async fn delete_many(

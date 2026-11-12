@@ -122,11 +122,25 @@ lists where and why. Things a host needs to know:
   routers): a handler computes `record_etag`/`list_etag` from `Versioned`
   records, answers `not_modified(headers, etag)` when it returns `Some`, and
   otherwise attaches `revalidation_headers(etag)`; a single-record `PATCH` or
-  `DELETE` calls `check_if_match` first. The tags are `lib-crud-py`'s, so the
-  SDKs behave the same. Nothing is applied automatically, so
+  `DELETE` reads the record, calls `expected_version(headers, &record, name)?`
+  (the `If-Match` check, as `check_if_match`, returning the version to write
+  against) and passes it to `update`/`delete`. The tags are `lib-crud-py`'s,
+  so the SDKs behave the same. Nothing is applied automatically, so
   `Features::conditional_requests` in the manifest stays the host's switch: set
   it once the handlers do this. See
   [ADR 0008](docs/adrs/0008-conditional-requests.md).
+- Optimistic concurrency is atomic: `Repository::update` and `delete` take
+  `expected_version: Option<NaiveDateTime>` (the record's `updated_at`).
+  `Some(v)` writes only if the row is still at `v`, checked in the same
+  statement as the write (SQL `... AND updated_at = $n`); `None` is the
+  explicit unconditional write. A record that exists at another version is
+  `RepoError::VersionConflict` (HTTP 412); a missing, foreign or archived
+  record stays a 404. An implementation moves `updated_at` on every write.
+  **Breaking since 0.x (ADR 0013):** add the argument to your `Repository`
+  impls, `dyn_repository!` users and `update`/`delete`/`resolve_update`/
+  `resolve_update_by_id`/`resolve_delete` calls (pass `None` for the old
+  behaviour), and replace `check_if_match` + write with `expected_version` +
+  write. See [ADR 0013](docs/adrs/0013-atomic-optimistic-concurrency.md).
 - A repository must honour the `owner_id` equality clause that bulk actions
   append (see `Repository`).
 
