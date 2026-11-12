@@ -212,6 +212,12 @@ fn parse_flag<K: AsRef<str>, V: AsRef<str>>(
 /// `include_archived`, so `true` next to an explicit `include_archived=false`
 /// is contradictory. Absent or `false` is `false` and changes nothing.
 ///
+/// Reading archived rows is **the host's to gate**. The crate parses the flag
+/// for any caller and the repository returns every owner's archived rows,
+/// because reads are open (see [`Repository`](crate::repositories::Repository)).
+/// A host that does not want every reader to see rows an owner deleted on
+/// purpose must check a role (or ignore the flag) *before* it calls this.
+///
 /// # Errors
 ///
 /// A [`FieldError`] on `only_archived` for a malformed value or for the

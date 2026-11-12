@@ -31,18 +31,53 @@
 //! behind it. The number of anonymous streams open at once is capped
 //! ([`EventBus::with_max_anonymous_connections`]): over the cap
 //! [`EventBus::subscribe`] fails with
-//! [`EventError::TooManyAnonymousConnections`], so unauthenticated callers
-//! cannot hold unlimited connections and tasks. A client that resumes with its
-//! id is not counted. The cap is a backstop with two limits to know about.
-//! It counts *open* streams, not the sessions they leave: a caller that
-//! connects, disconnects and repeats is bounded by the broker's own session
-//! expiry (`persistent_client_expiration`), not by this cap. And it is one
-//! budget for the whole bus, so a caller holding that many idle streams can
-//! refuse every first-time subscriber; per-client limits (by IP or by
-//! credential) belong in the host's rate limiter or reverse proxy, in front of
-//! the events route. Nor does it limit how many streams run under one issued
-//! id (on MQTT they share a client id, so the broker keeps replacing the older
-//! connection); that too is the host's to rate-limit.
+//! [`EventError::TooManyAnonymousConnections`]. A client that resumes with its
+//! id is not counted. That cap is one budget for the whole bus, so it is only
+//! a backstop; the per-caller limits below are what bound one caller.
+//!
+//! ## Stream limits (the HTTP events route)
+//!
+//! [`EventBus::subscribe_for_caller`], which the events route uses, also
+//! bounds the streams open at once per *caller* (the host passes the owner
+//! scope's value; default [`DEFAULT_MAX_STREAMS_PER_CALLER`], counted across
+//! resources) and per *subscriber id* ([`DEFAULT_MAX_STREAMS_PER_SUBSCRIBER`],
+//! so one issued id cannot be opened over and over). Over either limit it
+//! fails with [`EventError::TooManyStreams`] (a `429`). A slot is released when
+//! the [`EventStream`] is dropped, on every exit path. The limits are per
+//! process: with N instances the effective cap is N times larger. Callers a
+//! host cannot tell apart should pass one shared key and so share one budget.
+//!
+//! The route's streams are *transient* (clean session, no replay, a client's
+//! `subscriber_id` is ignored) unless the host opts into durable sessions with
+//! [`EventBus::with_durable_streams`]; a durable session is then kept by the
+//! broker for [`DEFAULT_SESSION_TTL`] after the connection ends unless
+//! [`EventBus::with_session_ttl`] or [`EventBus::without_session_ttl`] says
+//! otherwise. See `docs/adrs/0012-hardened-mqtt-and-event-streams.md`.
+//!
+//! ## Securing the MQTT connection
+//!
+//! [`EventBus::with_mqtt_credentials`] sets a user name and password and
+//! [`EventBus::with_mqtt_tls`] (feature `mqtt-tls`, rumqttc over the system
+//! OpenSSL through native-tls) a [`MqttTls`]: a CA bundle that alone is
+//! trusted to verify the broker and its host name, and optionally a client
+//! certificate and key for mutual TLS. TLS 1.2 is the floor and host name
+//! verification cannot be switched off. Credentials without TLS are refused unless
+//! [`EventBus::with_mqtt_allow_insecure`] says otherwise; the check runs when
+//! a connection is opened, and [`EventBus::validate`] runs it at startup. The
+//! key files are read each time a connection is opened, so rotating them needs no restart.
+//! Secrets are redacted from `Debug` output.
+//!
+//! ## Delivery (MQTT bus)
+//!
+//! Events are best effort. [`EventBus::publish`] queues each one on a single
+//! shared publisher connection, opened on first use. A failure is logged and
+//! counted ([`EventBus::delivery_stats`]), never returned, so a broker outage
+//! is not a `500`. A publish that times out or is cancelled discards the shared
+//! connection (the next one opens a new one). To announce a change only once it
+//! is durable, record it in a [`PendingEvents`] while the transaction runs and
+//! call [`PendingEvents::commit`] after the database commit.
+//! [`EventBus::shutdown`] waits for publishes in flight and then closes the
+//! connection.
 //!
 //! ## Transient subscribers
 //!
@@ -67,10 +102,11 @@
 //! (MQTT 5.0 sections 3.1.2.4 and 3.1.2.11.2), so a browser SSE client that
 //! never returns has its session and queued events dropped by the broker after
 //! the TTL, with no broker-wide setting needed. Within the TTL a returning id
-//! is replayed as before. Unset (the default) keeps MQTT 3.1.1 and leaves
-//! expiry to the broker. Transient subscribers and the publisher stay on
-//! 3.1.1; the broker delivers between the two versions. The broker must speak
-//! MQTT 5.0 and may cap the value (Mosquitto's `max_session_expiry_interval`).
+//! is replayed as before. The default is [`DEFAULT_SESSION_TTL`] (one hour);
+//! [`EventBus::without_session_ttl`] keeps MQTT 3.1.1 and leaves expiry to the
+//! broker. Transient subscribers and the publisher stay on 3.1.1; the broker
+//! delivers between the two versions. The broker must speak MQTT 5.0 and may
+//! cap the value (Mosquitto's `max_session_expiry_interval`).
 //! See `docs/adrs/0007-durable-session-ttl.md`.
 //!
 //! ## Delivery guarantee (MQTT bus, and its exact scope)
@@ -102,22 +138,32 @@
 //! The in-memory bus cannot validate the guarantee; only a test against a real
 //! broker (`tests/mqtt_events.rs`) does.
 
+use std::collections::HashMap;
 #[cfg(feature = "mqtt")]
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::panic::AssertUnwindSafe;
+#[cfg(feature = "mqtt-tls")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "mqtt")]
+use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 #[cfg(feature = "mqtt")]
 use std::time::Instant;
 
 use hmac::{Hmac, KeyInit, Mac};
+#[cfg(feature = "mqtt-tls")]
+use rumqttc::TlsConfiguration;
 #[cfg(feature = "mqtt")]
 use rumqttc::{
     AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS, SubscribeReasonCode,
-    v5 as mqtt5,
+    Transport, v5 as mqtt5,
 };
 use sha2::Sha256;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+#[cfg(feature = "mqtt")]
+use tokio::task::JoinHandle;
 
 /// What an event loop's poll produced, reduced to what this module acts on,
 /// so one stream type serves both MQTT 3.1.1 and MQTT 5.0 connections.
@@ -255,21 +301,6 @@ async fn drive_publisher_eventloop<P: MqttPoll>(mut eventloop: P) {
     }
 }
 
-/// Queue `value` as a JSON `QoS` 1, non-retained message on `topic`, without
-/// waiting: a full request queue (broker unreachable) is an error, so a CRUD
-/// handler never hangs on a side-channel notification.
-#[cfg(feature = "mqtt")]
-fn publish_json<T: serde::Serialize + ?Sized>(
-    publisher: &AsyncClient,
-    topic: String,
-    value: &T,
-) -> Result<(), String> {
-    let payload = serde_json::to_vec(value).map_err(|err| err.to_string())?;
-    publisher
-        .try_publish(topic, QoS::AtLeastOnce, false, payload)
-        .map_err(|err| err.to_string())
-}
-
 /// Queue a `QoS` 1 subscription to `topic` on `client`.
 #[cfg(feature = "mqtt")]
 async fn subscribe_to(client: &SubscriberClient, topic: String) -> Result<(), EventError> {
@@ -347,6 +378,43 @@ pub const MIN_SUBSCRIBER_SECRET_LEN: usize = 32;
 /// How many anonymous connections a bus allows at once unless the host
 /// says otherwise.
 pub const DEFAULT_MAX_ANONYMOUS_CONNECTIONS: usize = 256;
+
+/// How many `/events` streams one caller may hold open at once unless the
+/// host says otherwise.
+pub const DEFAULT_MAX_STREAMS_PER_CALLER: usize = 5;
+
+/// How many streams may run under one subscriber id at once unless the host
+/// says otherwise. Two, not one: a browser that reconnects can overlap the
+/// connection the server has not yet noticed is gone.
+pub const DEFAULT_MAX_STREAMS_PER_SUBSCRIBER: usize = 2;
+
+/// How long the broker keeps a durable subscriber's session after its
+/// connection ends, unless the host says otherwise. One hour.
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(3600);
+
+/// [`DEFAULT_SESSION_TTL`] as a Session Expiry Interval, in seconds.
+#[cfg(feature = "mqtt")]
+const DEFAULT_SESSION_TTL_SECONDS: u32 = 3600;
+
+/// How long one publish may wait for room in the publisher's request queue
+/// before the shared connection is discarded.
+#[cfg(all(feature = "mqtt", not(test)))]
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(all(feature = "mqtt", test))]
+const PUBLISH_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long [`EventBus::shutdown`] waits for publishes in flight.
+#[cfg(not(test))]
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long [`EventBus::shutdown`] lets the publisher connection flush its
+/// queue after the disconnect request.
+#[cfg(all(feature = "mqtt", not(test)))]
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+#[cfg(all(feature = "mqtt", test))]
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(5);
 
 /// Fan-out queue depth for the the in-memory bus broadcast channel, and the
 /// per-connection request-channel capacity for the real `AsyncClient`.
@@ -525,6 +593,14 @@ pub enum EventError {
     /// be given a fresh subscriber id; the caller should retry with the id
     /// it was issued.
     TooManyAnonymousConnections,
+    #[error("too many concurrent event streams")]
+    /// The caller, or the subscriber id it presented, already holds its
+    /// maximum number of open streams.
+    TooManyStreams,
+    #[error("invalid event bus configuration: {0}")]
+    /// The MQTT settings are refused (credentials without TLS) or unusable
+    /// (a TLS file cannot be read).
+    Config(String),
 }
 
 /// One slot of the anonymous-connection budget, returned when the stream
@@ -537,20 +613,404 @@ impl Drop for AnonymousPermit {
     }
 }
 
+/// Open-stream counts by key (caller and subscriber id).
+type StreamCounts = Arc<Mutex<HashMap<String, usize>>>;
+
+/// One caller's and one subscriber id's share of the stream limits, returned
+/// when the stream that holds it is dropped (on every exit path).
+struct StreamSlot {
+    counts: StreamCounts,
+    keys: [String; 2],
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        for key in &self.keys {
+            counts.entry(key.clone()).and_modify(|open| *open -= 1);
+            if counts.get(key) == Some(&0) {
+                counts.remove(key);
+            }
+        }
+    }
+}
+
+/// What happened to the events handed to a bus since it was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeliveryStats {
+    /// Events queued for the broker (MQTT) or fanned out (in-memory).
+    pub published: u64,
+    /// Events dropped: the broker connection failed or timed out, or the bus
+    /// was shutting down.
+    pub failed: u64,
+}
+
+/// A user name and password for the broker. The password never appears in
+/// `Debug` output.
+#[cfg(feature = "mqtt")]
+#[derive(Clone)]
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+#[cfg(feature = "mqtt")]
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Where the broker's certificate is verified against, and optionally the
+/// client certificate to present: the options of
+/// [`EventBus::with_mqtt_tls`].
+///
+/// The files are PEM and are read each time the bus opens a connection (a
+/// new publisher or subscriber), so a rotated certificate takes effect for
+/// those without a restart; the automatic reconnects of a connection that
+/// is already open keep the certificates it was opened with. The CA bundle (one or more
+/// certificates) is required and is the only trust anchor: the system store
+/// is not consulted (to trust it, point the bundle at the system one, for
+/// example `/etc/ssl/certs/ca-certificates.crt`). The client key is PKCS#8
+/// PEM (the unencrypted PKCS#8 form). TLS 1.2 is the minimum and the broker's host
+/// name is always verified against its certificate. The feature links the
+/// system OpenSSL: building needs `pkg-config` and `libssl-dev`, running
+/// needs `libssl3`.
+#[cfg(feature = "mqtt-tls")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttTls {
+    ca_file: PathBuf,
+    client_auth: Option<(PathBuf, PathBuf)>,
+}
+
+#[cfg(feature = "mqtt-tls")]
+impl MqttTls {
+    /// Verify the broker against the PEM bundle at `ca_file`.
+    #[must_use]
+    pub fn new(ca_file: impl Into<PathBuf>) -> Self {
+        Self {
+            ca_file: ca_file.into(),
+            client_auth: None,
+        }
+    }
+
+    /// Present the PEM certificate chain at `cert_file` with its private key
+    /// at `key_file` (mutual TLS).
+    #[must_use]
+    pub fn with_client_auth(
+        mut self,
+        cert_file: impl Into<PathBuf>,
+        key_file: impl Into<PathBuf>,
+    ) -> Self {
+        self.client_auth = Some((cert_file.into(), key_file.into()));
+        self
+    }
+}
+
+/// The security options of the MQTT connections, and the rules about them.
+#[cfg(feature = "mqtt")]
+#[derive(Debug, Default)]
+struct MqttSettings {
+    credentials: Option<Credentials>,
+    allow_insecure: bool,
+    #[cfg(feature = "mqtt-tls")]
+    tls: Option<MqttTls>,
+}
+
+/// The security options resolved for one connection attempt: the credentials
+/// and, with TLS, the transport built from the files as they are now.
+#[cfg(feature = "mqtt")]
+struct Security {
+    credentials: Option<Credentials>,
+    transport: Option<Transport>,
+}
+
+#[cfg(feature = "mqtt")]
+impl MqttSettings {
+    fn has_tls(&self) -> bool {
+        #[cfg(feature = "mqtt-tls")]
+        {
+            self.tls.is_some()
+        }
+        #[cfg(not(feature = "mqtt-tls"))]
+        {
+            false
+        }
+    }
+
+    /// Refuse credentials that would cross the network in clear text.
+    fn validate(&self) -> Result<(), String> {
+        if self.credentials.is_some() && !self.allow_insecure && !self.has_tls() {
+            return Err(
+                "MQTT credentials are refused without TLS: configure with_mqtt_tls, \
+                        or opt in with with_mqtt_allow_insecure for a local broker"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate, then read the TLS files for a new connection.
+    #[cfg_attr(
+        not(feature = "mqtt-tls"),
+        expect(clippy::unused_async, reason = "only the TLS build reads files")
+    )]
+    async fn security(&self) -> Result<Security, String> {
+        self.validate()?;
+        #[cfg(feature = "mqtt-tls")]
+        let transport = self.load_transport().await?;
+        #[cfg(not(feature = "mqtt-tls"))]
+        let transport = None;
+        Ok(Security {
+            credentials: self.credentials.clone(),
+            transport,
+        })
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    async fn load_transport(&self) -> Result<Option<Transport>, String> {
+        let Some(tls) = &self.tls else {
+            return Ok(None);
+        };
+        let ca = read_pem(&tls.ca_file).await?;
+        let client_auth = match &tls.client_auth {
+            Some((cert, key)) => Some((read_pem(cert).await?, read_pem(key).await?)),
+            None => None,
+        };
+        let connector = build_connector(&ca, client_auth.as_ref())
+            .map_err(|err| format!("invalid TLS configuration: {err}"))?;
+        Ok(Some(Transport::tls_with_config(
+            TlsConfiguration::NativeConnector(connector),
+        )))
+    }
+}
+
+/// The TLS connector for one connection: TLS 1.2 or later, the host name
+/// always verified, and only the certificates of `ca` (a PEM bundle) trusted.
+/// `client` is the PEM certificate chain and PKCS#8 PEM key to present.
+#[cfg(feature = "mqtt-tls")]
+fn build_connector(
+    ca: &[u8],
+    client: Option<&(Vec<u8>, Vec<u8>)>,
+) -> Result<native_tls::TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut builder = native_tls::TlsConnector::builder();
+    builder
+        .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+        .disable_built_in_roots(true);
+    let text = String::from_utf8_lossy(ca);
+    let mut trusted = 0;
+    // `Certificate::from_pem` reads one certificate, so split the bundle.
+    for block in text.split_inclusive(END) {
+        if block.contains(BEGIN) {
+            builder.add_root_certificate(native_tls::Certificate::from_pem(block.as_bytes())?);
+            trusted += 1;
+        }
+    }
+    if trusted == 0 {
+        return Err("the CA file holds no PEM certificate".into());
+    }
+    if let Some((cert, key)) = client {
+        builder.identity(native_tls::Identity::from_pkcs8(cert, key)?);
+    }
+    Ok(builder.build()?)
+}
+
+/// One PEM file, or why it could not be read.
+#[cfg(feature = "mqtt-tls")]
+async fn read_pem(path: &Path) -> Result<Vec<u8>, String> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+    }
+}
+
+/// Apply the credentials and transport to an MQTT 3.1.1 connection.
+#[cfg(feature = "mqtt")]
+fn secure_v3(options: &mut MqttOptions, security: &Security) {
+    if let Some(login) = &security.credentials {
+        options.set_credentials(login.username.clone(), login.password.clone());
+    }
+    if let Some(transport) = &security.transport {
+        options.set_transport(transport.clone());
+    }
+}
+
+/// Apply the credentials and transport to an MQTT 5.0 connection.
+#[cfg(feature = "mqtt")]
+fn secure_v5(options: &mut mqtt5::MqttOptions, security: &Security) {
+    if let Some(login) = &security.credentials {
+        options.set_credentials(login.username.clone(), login.password.clone());
+    }
+    if let Some(transport) = &security.transport {
+        options.set_transport(transport.clone());
+    }
+}
+
+/// The shared publisher connection: the client and the task that drives its
+/// event loop. Dropping it stops the task and closes the connection.
+#[cfg(feature = "mqtt")]
+struct Publisher {
+    client: AsyncClient,
+    generation: u64,
+    task: JoinHandle<()>,
+}
+
+#[cfg(feature = "mqtt")]
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Discards the shared publisher on drop unless disarmed, so a publish that
+/// fails, times out or is cancelled mid-flight never leaves a connection in an
+/// unknown state behind it.
+#[cfg(feature = "mqtt")]
+struct DiscardGuard<'a> {
+    backend: &'a MqttBackend,
+    generation: u64,
+    armed: bool,
+}
+
+#[cfg(feature = "mqtt")]
+impl Drop for DiscardGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.backend.discard(self.generation);
+        }
+    }
+}
+
+/// The MQTT side of an [`EventBus`]: the broker address, how to secure the
+/// connections, and the one lazily opened publisher every publish shares.
+/// Every subscriber needs a distinct client id, so each opens its *own*
+/// persistent session against the same address.
+#[cfg(feature = "mqtt")]
+struct MqttBackend {
+    host: String,
+    port: u16,
+    /// Session Expiry Interval, in seconds, for durable subscribers;
+    /// `None` keeps MQTT 3.1.1 sessions (see [`EventBus::with_session_ttl`]).
+    session_ttl: Option<u32>,
+    settings: MqttSettings,
+    publisher: Mutex<Option<Publisher>>,
+    /// Serialises opening the publisher so concurrent first publishes open
+    /// one connection. Behind `AssertUnwindSafe` because tokio's `Mutex` is
+    /// not `RefUnwindSafe` and `EventBus` was; it guards no data.
+    opening: AssertUnwindSafe<tokio::sync::Mutex<()>>,
+    generations: AtomicU64,
+}
+
+#[cfg(feature = "mqtt")]
+impl MqttBackend {
+    fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            session_ttl: Some(DEFAULT_SESSION_TTL_SECONDS),
+            settings: MqttSettings::default(),
+            publisher: Mutex::new(None),
+            opening: AssertUnwindSafe(tokio::sync::Mutex::new(())),
+            generations: AtomicU64::new(0),
+        }
+    }
+
+    fn publisher_slot(&self) -> MutexGuard<'_, Option<Publisher>> {
+        self.publisher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drop the shared publisher if it is still the one of `generation`.
+    fn discard(&self, generation: u64) {
+        let mut slot = self.publisher_slot();
+        if slot
+            .as_ref()
+            .is_some_and(|open| open.generation == generation)
+        {
+            *slot = None;
+        }
+    }
+
+    /// The shared publisher's client, opening the connection on first use.
+    /// Nothing waits for the broker: rumqttc queues publishes and flushes
+    /// them once the event loop connects.
+    ///
+    /// The publisher deliberately uses a *clean* session with its own
+    /// process-scoped client id -- only subscribers need persistence, and a
+    /// persistent publisher session would accumulate broker state for a
+    /// client that never subscribes to anything.
+    async fn shared_client(&self) -> Result<(AsyncClient, u64), String> {
+        let _opening = self.opening.lock().await;
+        if let Some(open) = self.publisher_slot().as_ref() {
+            return Ok((open.client.clone(), open.generation));
+        }
+        let security = self.settings.security().await?;
+        let client_id = format!("crud-events-publisher-{}", random_token());
+        let mut options = MqttOptions::new(client_id, &self.host, self.port);
+        options.set_keep_alive(KEEP_ALIVE);
+        options.set_clean_session(true);
+        secure_v3(&mut options, &security);
+        let (client, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+        // The event loop is what actually drives the socket; a publish only
+        // leaves the process while something polls it. Nothing consumes
+        // incoming packets on the publisher connection, so this task just
+        // keeps it turning and logs failures.
+        let task = tokio::spawn(drive_publisher_eventloop(eventloop));
+        *self.publisher_slot() = Some(Publisher {
+            client: client.clone(),
+            generation,
+            task,
+        });
+        Ok((client, generation))
+    }
+
+    /// Queue `event` as a JSON `QoS` 1, non-retained message on its topic.
+    /// Waiting for room in the request queue is bounded by
+    /// [`PUBLISH_TIMEOUT`]; a failure, a timeout or a cancelled call discards
+    /// the shared connection.
+    async fn send(
+        &self,
+        event: &CrudEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = serde_json::to_vec(event)?;
+        let (client, generation) = self.shared_client().await?;
+        let mut guard = DiscardGuard {
+            backend: self,
+            generation,
+            armed: true,
+        };
+        let publish = client.publish(topic(&event.resource), QoS::AtLeastOnce, false, payload);
+        match tokio::time::timeout(PUBLISH_TIMEOUT, publish).await {
+            Ok(Ok(())) => {
+                guard.armed = false;
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err.into()),
+            Err(_) => Err("timed out queueing the event for the broker".into()),
+        }
+    }
+
+    /// Disconnect the shared publisher, giving its event loop a moment to
+    /// flush what is queued.
+    async fn close(&self) {
+        let open = self.publisher_slot().take();
+        if let Some(open) = open {
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, open.client.disconnect()).await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        }
+    }
+}
+
 enum Backend {
-    /// A long-lived publisher client plus the broker address every
-    /// subscriber opens its *own* persistent session against (each
-    /// subscriber needs a distinct client id, so they cannot share one
-    /// connection).
     #[cfg(feature = "mqtt")]
-    Mqtt {
-        host: String,
-        port: u16,
-        publisher: AsyncClient,
-        /// Session Expiry Interval, in seconds, for durable subscribers;
-        /// `None` keeps MQTT 3.1.1 sessions (see [`EventBus::with_session_ttl`]).
-        session_ttl: Option<u32>,
-    },
+    Mqtt(Box<MqttBackend>),
     Mock(broadcast::Sender<CrudEvent>),
 }
 
@@ -561,49 +1021,156 @@ pub struct EventBus {
     secret: Vec<u8>,
     anonymous: Arc<AtomicUsize>,
     max_anonymous: usize,
+    // `stream_counts`, `inflight` and `drained` sit behind `AssertUnwindSafe`
+    // to keep `EventBus` `RefUnwindSafe`, as it was before they existed: a
+    // panic inside one of their short critical sections leaves nothing
+    // half-updated, and every lock recovers from poisoning.
+    stream_counts: AssertUnwindSafe<StreamCounts>,
+    max_streams_per_caller: Option<usize>,
+    max_streams_per_subscriber: Option<usize>,
+    durable_streams: bool,
+    /// A clone of the sender is held by every publish in flight; shutdown
+    /// removes this one and waits for the rest to drop.
+    inflight: AssertUnwindSafe<Mutex<Option<mpsc::Sender<()>>>>,
+    drained: AssertUnwindSafe<Mutex<Option<mpsc::Receiver<()>>>>,
+    published: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl std::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("EventBus");
+        match &self.backend {
+            #[cfg(feature = "mqtt")]
+            Backend::Mqtt(mqtt) => {
+                debug
+                    .field("backend", &"mqtt")
+                    .field("host", &mqtt.host)
+                    .field("port", &mqtt.port)
+                    .field("settings", &mqtt.settings);
+            }
+            Backend::Mock(_) => {
+                debug.field("backend", &"mock");
+            }
+        }
+        debug
+            .field("subscriber_secret", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl EventBus {
     fn with_backend(backend: Backend) -> Self {
+        let (inflight, drained) = mpsc::channel(1);
         Self {
             backend,
             secret: random_bytes::<SECRET_BYTES>().to_vec(),
             anonymous: Arc::new(AtomicUsize::new(0)),
             max_anonymous: DEFAULT_MAX_ANONYMOUS_CONNECTIONS,
+            stream_counts: AssertUnwindSafe(Arc::new(Mutex::new(HashMap::new()))),
+            max_streams_per_caller: Some(DEFAULT_MAX_STREAMS_PER_CALLER),
+            max_streams_per_subscriber: Some(DEFAULT_MAX_STREAMS_PER_SUBSCRIBER),
+            durable_streams: false,
+            inflight: AssertUnwindSafe(Mutex::new(Some(inflight))),
+            drained: AssertUnwindSafe(Mutex::new(Some(drained))),
+            published: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
         }
     }
 
-    /// Connect the publisher side to the broker. The returned bus is usable
-    /// immediately: rumqttc queues publishes on the `AsyncClient`'s request
-    /// channel and flushes them once its event loop connects, so startup
-    /// never blocks on broker availability. (Subscribing does wait for the
-    /// broker: see [`subscribe`](Self::subscribe).)
+    /// A bus on the MQTT broker at `host`:`port`. It is usable immediately
+    /// and nothing connects yet: the shared publisher opens on the first
+    /// [`publish`](Self::publish), and rumqttc queues publishes and flushes
+    /// them once its event loop connects, so startup never blocks on broker
+    /// availability. (Subscribing does wait for the broker: see
+    /// [`subscribe`](Self::subscribe).)
     ///
-    /// The publisher deliberately uses a *clean* session with its own
-    /// process-scoped client id -- only subscribers need persistence, and a
-    /// persistent publisher session would accumulate broker state for a
-    /// client that never subscribes to anything.
+    /// The connection is plaintext and anonymous until
+    /// [`with_mqtt_tls`](Self::with_mqtt_tls) and
+    /// [`with_mqtt_credentials`](Self::with_mqtt_credentials) say otherwise.
+    /// Durable subscribers keep their session for [`DEFAULT_SESSION_TTL`]
+    /// (over MQTT 5.0, so the broker must speak it; see
+    /// [`without_session_ttl`](Self::without_session_ttl)).
     #[cfg(feature = "mqtt")]
     #[must_use]
     pub fn connect(host: &str, port: u16) -> Self {
-        let client_id = format!("crud-events-publisher-{}", random_token());
-        let mut options = MqttOptions::new(client_id, host, port);
-        options.set_keep_alive(KEEP_ALIVE);
-        options.set_clean_session(true);
-        let (publisher, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
+        Self::with_backend(Backend::Mqtt(Box::new(MqttBackend::new(host, port))))
+    }
 
-        // The event loop is what actually drives the socket; a publish only
-        // leaves the process while something polls it. Nothing consumes
-        // incoming packets on the publisher connection, so this task just
-        // keeps it turning and logs failures.
-        tokio::spawn(drive_publisher_eventloop(eventloop));
+    /// The MQTT side, if this is an MQTT bus.
+    #[cfg(feature = "mqtt")]
+    fn mqtt(&self) -> Option<&MqttBackend> {
+        match &self.backend {
+            Backend::Mqtt(mqtt) => Some(mqtt.as_ref()),
+            Backend::Mock(_) => None,
+        }
+    }
 
-        Self::with_backend(Backend::Mqtt {
-            host: host.to_string(),
-            port,
-            publisher,
-            session_ttl: None,
-        })
+    /// Change the MQTT settings; a no-op on the in-memory bus.
+    #[cfg(feature = "mqtt")]
+    fn with_mqtt(mut self, change: impl FnOnce(&mut MqttBackend)) -> Self {
+        if let Backend::Mqtt(mqtt) = &mut self.backend {
+            change(mqtt.as_mut());
+        }
+        self
+    }
+
+    /// Log in to the broker as `username` with `password`, on every MQTT
+    /// connection. Refused (see [`validate`](Self::validate)) unless TLS is
+    /// configured with [`with_mqtt_tls`](Self::with_mqtt_tls) or
+    /// [`with_mqtt_allow_insecure`](Self::with_mqtt_allow_insecure) says a
+    /// plaintext link is acceptable. The password is redacted from `Debug`.
+    /// The in-memory bus ignores it.
+    #[cfg(feature = "mqtt")]
+    #[must_use]
+    pub fn with_mqtt_credentials(
+        self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        let login = Credentials {
+            username: username.into(),
+            password: password.into(),
+        };
+        self.with_mqtt(|mqtt| mqtt.settings.credentials = Some(login))
+    }
+
+    /// Connect to the broker over TLS (1.2 or later), verifying its
+    /// certificate and host name against `tls`. The in-memory bus ignores it.
+    #[cfg(feature = "mqtt-tls")]
+    #[must_use]
+    pub fn with_mqtt_tls(self, tls: MqttTls) -> Self {
+        self.with_mqtt(|mqtt| mqtt.settings.tls = Some(tls))
+    }
+
+    /// Allow credentials over a connection without TLS, for a broker on a
+    /// trusted local network or a development stack. It changes nothing else:
+    /// when TLS is configured the broker is still verified.
+    #[cfg(feature = "mqtt")]
+    #[must_use]
+    pub fn with_mqtt_allow_insecure(self) -> Self {
+        self.with_mqtt(|mqtt| mqtt.settings.allow_insecure = true)
+    }
+
+    /// Check the MQTT settings without connecting, so a host can fail at
+    /// startup. Every connection runs the same check and fails closed, but
+    /// only when it is opened (a publish then logs and counts the failure).
+    ///
+    /// # Errors
+    ///
+    /// [`EventError::Config`] when credentials are set without TLS and
+    /// without [`with_mqtt_allow_insecure`](Self::with_mqtt_allow_insecure).
+    pub fn validate(&self) -> Result<(), EventError> {
+        #[cfg(feature = "mqtt")]
+        {
+            self.mqtt().map_or(Ok(()), |mqtt| {
+                mqtt.settings.validate().map_err(EventError::Config)
+            })
+        }
+        #[cfg(not(feature = "mqtt"))]
+        {
+            Ok(())
+        }
     }
 
     /// The the in-memory bus in-memory fan-out -- see the module doc for what it
@@ -652,8 +1219,9 @@ impl EventBus {
     /// session, and the events queued in it, that long after its connection
     /// ends. A client that returns within `ttl` with its `subscriber_id` is
     /// replayed exactly as without a TTL; one that returns later gets a fresh
-    /// session. Without this call (the default) durable subscribers stay on
-    /// MQTT 3.1.1 and expiry is left to the broker.
+    /// session. The default is [`DEFAULT_SESSION_TTL`] (one hour);
+    /// [`without_session_ttl`](Self::without_session_ttl) goes back to MQTT
+    /// 3.1.1 and leaves expiry to the broker.
     ///
     /// Transient subscribers ([`subscribe_transient`](Self::subscribe_transient))
     /// and the publisher stay on MQTT 3.1.1, which the broker bridges to
@@ -673,23 +1241,64 @@ impl EventBus {
             .ok()
             .filter(|&seconds| seconds >= 1)
             .expect("the session TTL must be between 1 and 4294967295 seconds");
-        // Keep `mut` inside the mqtt-only block: with `mut self` in the
-        // signature, the default build warns "variable does not need to be
-        // mutable", since only the mqtt backend mutates `self`.
         #[cfg(feature = "mqtt")]
-        let this = {
-            let mut this = self;
-            if let Backend::Mqtt { session_ttl, .. } = &mut this.backend {
-                *session_ttl = Some(seconds);
-            }
-            this
-        };
+        let this = self.with_mqtt(|mqtt| mqtt.session_ttl = Some(seconds));
         #[cfg(not(feature = "mqtt"))]
         let this = {
             let _ = seconds;
             self
         };
         this
+    }
+
+    /// Leave the expiry of abandoned durable sessions to the broker: durable
+    /// subscribers go back to MQTT 3.1.1 instead of the
+    /// [`DEFAULT_SESSION_TTL`] over MQTT 5.0, for a broker that does not speak
+    /// 5.0. Set the broker's own persistent-session expiry then. The in-memory
+    /// bus ignores it.
+    #[must_use]
+    pub fn without_session_ttl(self) -> Self {
+        #[cfg(feature = "mqtt")]
+        let this = self.with_mqtt(|mqtt| mqtt.session_ttl = None);
+        #[cfg(not(feature = "mqtt"))]
+        let this = self;
+        this
+    }
+
+    /// Allow at most `max` concurrent streams per caller on
+    /// [`subscribe_for_caller`](Self::subscribe_for_caller) (default
+    /// [`DEFAULT_MAX_STREAMS_PER_CALLER`]); `None` removes the limit.
+    #[must_use]
+    pub fn with_max_streams_per_caller(mut self, max: Option<usize>) -> Self {
+        self.max_streams_per_caller = max;
+        self
+    }
+
+    /// Allow at most `max` concurrent streams under one subscriber id on
+    /// [`subscribe_for_caller`](Self::subscribe_for_caller) (default
+    /// [`DEFAULT_MAX_STREAMS_PER_SUBSCRIBER`]); `None` removes the limit.
+    #[must_use]
+    pub fn with_max_streams_per_subscriber(mut self, max: Option<usize>) -> Self {
+        self.max_streams_per_subscriber = max;
+        self
+    }
+
+    /// Let [`subscribe_for_caller`](Self::subscribe_for_caller) (the HTTP
+    /// events route) open *durable* sessions that a client resumes with its
+    /// `subscriber_id` or `Last-Event-ID`. Without this call (the default) the
+    /// route's streams are transient: a clean session, no replay, and a
+    /// client-supplied id is ignored.
+    #[must_use]
+    pub fn with_durable_streams(mut self) -> Self {
+        self.durable_streams = true;
+        self
+    }
+
+    /// Whether [`with_durable_streams`](Self::with_durable_streams) was set.
+    /// A host advertises replay in its manifest only when it is.
+    #[must_use]
+    pub fn durable_streams(&self) -> bool {
+        self.durable_streams
     }
 
     /// Mint a subscriber id for `resource`: 128 random bits plus an HMAC tag
@@ -726,29 +1335,144 @@ impl EventBus {
         Ok(AnonymousPermit(Arc::clone(&self.anonymous)))
     }
 
-    /// Publish one event at `QoS` 1, non-retained. Failures are logged, never
-    /// propagated: a CRUD write that already succeeded must not be reported
-    /// to the caller as failed because a side-channel notification could
-    /// not be delivered. That also means an event can be lost before it
-    /// reaches the broker (see the module doc).
-    #[expect(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        reason = "kept async so the signature is stable and the same with and without the `mqtt` feature"
+    fn acquire_stream_slot(
+        &self,
+        caller: &str,
+        subscriber_id: &str,
+    ) -> Result<StreamSlot, EventError> {
+        let keys = [
+            format!("caller:{caller}"),
+            format!("subscriber:{subscriber_id}"),
+        ];
+        let limits = [self.max_streams_per_caller, self.max_streams_per_subscriber];
+        let mut counts = self
+            .stream_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let full = keys.iter().zip(limits).any(|(key, limit)| {
+            limit.is_some_and(|max| counts.get(key).copied().unwrap_or(0) >= max)
+        });
+        if full {
+            return Err(EventError::TooManyStreams);
+        }
+        for key in &keys {
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        }
+        drop(counts);
+        Ok(StreamSlot {
+            counts: Arc::clone(&self.stream_counts.0),
+            keys,
+        })
+    }
+
+    /// A handle that keeps [`shutdown`](Self::shutdown) waiting, or `None`
+    /// once shutdown has begun.
+    fn track(&self) -> Option<mpsc::Sender<()>> {
+        self.inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Publish one event at `QoS` 1, non-retained. Failures are logged and
+    /// counted ([`delivery_stats`](Self::delivery_stats)), never propagated:
+    /// a CRUD write that already succeeded must not be reported to the
+    /// caller as failed because a side-channel notification could not be
+    /// delivered. That also means an event can be lost before it reaches the
+    /// broker (see the module doc).
+    ///
+    /// On MQTT the event goes out over one connection shared by every
+    /// publish, opened on first use. Waiting for room in its request queue is
+    /// bounded; a publish that fails, times out or is cancelled discards that
+    /// connection and the next publish opens a new one. After
+    /// [`shutdown`](Self::shutdown) an event is dropped and counted.
+    ///
+    /// To announce a change only once its transaction has committed, record it
+    /// in a [`PendingEvents`] and commit that instead of calling this
+    /// directly.
+    #[cfg_attr(
+        not(feature = "mqtt"),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "kept async so the signature is stable and the same with and without the `mqtt` feature"
+        )
     )]
     pub async fn publish(&self, event: CrudEvent) {
+        let Some(_inflight) = self.track() else {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("dropped CRUD event, the event bus is shut down");
+            return;
+        };
         match &self.backend {
             #[cfg(feature = "mqtt")]
-            Backend::Mqtt { publisher, .. } => {
-                if let Err(err) = publish_json(publisher, topic(&event.resource), &event) {
+            Backend::Mqtt(mqtt) => match mqtt.send(&event).await {
+                Ok(()) => {
+                    self.published.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!("dropped CRUD event, not queued for the broker: {err}");
                 }
-            }
+            },
             Backend::Mock(sender) => {
                 // `send` errors only when there are no receivers -- an idle
                 // stream with nobody watching, not a failure.
                 let _ = sender.send(event);
+                self.published.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// [`publish`](Self::publish) each of `events`, in order.
+    pub async fn publish_all(&self, events: Vec<CrudEvent>) {
+        for event in events {
+            self.publish(event).await;
+        }
+    }
+
+    /// How many events [`publish`](Self::publish) has queued and dropped so
+    /// far.
+    #[must_use]
+    pub fn delivery_stats(&self) -> DeliveryStats {
+        DeliveryStats {
+            published: self.published.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stop accepting events, wait (bounded) for the publishes in flight, then
+    /// disconnect the publisher, giving it a moment to flush its queue. Call it
+    /// when the host shuts down; open [`EventStream`]s are unaffected (end them
+    /// with `event_stream_until`). Later publishes are dropped and counted.
+    /// Calling it again is harmless.
+    pub async fn shutdown(&self) {
+        // Dropping the bus's own sender is what lets the receiver see the end
+        // once every publish in flight has dropped its clone.
+        drop(
+            self.inflight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        let receiver = self
+            .drained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let drained = match receiver {
+            Some(mut receiver) => tokio::time::timeout(DRAIN_TIMEOUT, receiver.recv())
+                .await
+                .is_ok(),
+            None => true,
+        };
+        if !drained {
+            tracing::warn!("event bus shutdown: publishes still in flight were not awaited");
+        }
+        match &self.backend {
+            #[cfg(feature = "mqtt")]
+            Backend::Mqtt(mqtt) => mqtt.close().await,
+            Backend::Mock(_) => {}
         }
     }
 
@@ -777,7 +1501,34 @@ impl EventBus {
         resource: &str,
         requested: Option<&str>,
     ) -> Result<(String, EventStream), EventError> {
-        self.open(resource, requested, true).await
+        self.open(None, resource, requested, true).await
+    }
+
+    /// [`subscribe`](Self::subscribe) as the HTTP events route uses it, for a
+    /// `caller` the host identifies (the owner scope's value; callers it cannot
+    /// tell apart share one key and so one budget).
+    ///
+    /// The stream is *transient* unless the bus was built
+    /// [`with_durable_streams`](Self::with_durable_streams), and then
+    /// `requested` is ignored (a clean-session connect under a durable id
+    /// would discard that session). The stream holds one of the caller's
+    /// [`DEFAULT_MAX_STREAMS_PER_CALLER`] slots and one of its subscriber id's
+    /// until it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`subscribe`](Self::subscribe), plus
+    /// [`EventError::TooManyStreams`] when the caller or the subscriber id is
+    /// at its limit, and [`EventError::Config`] for refused MQTT settings.
+    pub async fn subscribe_for_caller(
+        &self,
+        caller: &str,
+        resource: &str,
+        requested: Option<&str>,
+    ) -> Result<(String, EventStream), EventError> {
+        let requested = requested.filter(|_| self.durable_streams);
+        self.open(Some(caller), resource, requested, self.durable_streams)
+            .await
     }
 
     /// Like [`subscribe`](Self::subscribe), but *transient*: on the MQTT path
@@ -798,7 +1549,7 @@ impl EventBus {
         resource: &str,
         requested: Option<&str>,
     ) -> Result<(String, EventStream), EventError> {
-        self.open(resource, requested, false).await
+        self.open(None, resource, requested, false).await
     }
 
     #[cfg_attr(
@@ -811,6 +1562,7 @@ impl EventBus {
     )]
     async fn open(
         &self,
+        caller: Option<&str>,
         resource: &str,
         requested: Option<&str>,
         durable: bool,
@@ -825,14 +1577,12 @@ impl EventBus {
                     Some(self.acquire_anonymous()?),
                 ),
             };
+        let slot = caller
+            .map(|caller| self.acquire_stream_slot(caller, &subscriber_id))
+            .transpose()?;
         let inner = match &self.backend {
             #[cfg(feature = "mqtt")]
-            Backend::Mqtt {
-                host,
-                port,
-                session_ttl,
-                ..
-            } => open_mqtt(host, *port, resource, &subscriber_id, durable, *session_ttl).await?,
+            Backend::Mqtt(mqtt) => open_mqtt(mqtt, resource, &subscriber_id, durable).await?,
             Backend::Mock(sender) => Inner::Mock {
                 receiver: sender.subscribe(),
                 resource: resource.to_string(),
@@ -843,6 +1593,7 @@ impl EventBus {
             EventStream {
                 inner,
                 _permit: permit,
+                _slot: slot,
             },
         ))
     }
@@ -853,17 +1604,18 @@ impl EventBus {
 /// to accept it and the subscription.
 #[cfg(feature = "mqtt")]
 async fn open_mqtt(
-    host: &str,
-    port: u16,
+    mqtt: &MqttBackend,
     resource: &str,
     subscriber_id: &str,
     durable: bool,
-    session_ttl: Option<u32>,
 ) -> Result<Inner, EventError> {
+    let security = mqtt.settings.security().await.map_err(EventError::Config)?;
+    let (host, port) = (mqtt.host.as_str(), mqtt.port);
     let client_id = client_id_for(resource, subscriber_id);
     let (client, mut eventloop): (SubscriberClient, Box<dyn MqttPoll>) =
-        if let Some(ttl) = session_ttl.filter(|_| durable) {
+        if let Some(ttl) = mqtt.session_ttl.filter(|_| durable) {
             let mut options = mqtt5::MqttOptions::new(client_id, host, port);
+            secure_v5(&mut options, &security);
             options.set_keep_alive(KEEP_ALIVE);
             // Clean Start 0 keeps the stored session; the interval is what
             // makes the broker drop it after `ttl` once the connection ends.
@@ -873,6 +1625,7 @@ async fn open_mqtt(
             (SubscriberClient::V5(client), Box::new(eventloop))
         } else {
             let mut options = MqttOptions::new(client_id, host, port);
+            secure_v3(&mut options, &security);
             options.set_keep_alive(KEEP_ALIVE);
             // The entire delivery guarantee: a persistent session keyed by
             // this subscriber's own client id. The client id is never empty
@@ -897,13 +1650,126 @@ async fn open_mqtt(
     })
 }
 
+/// Events recorded while a database transaction runs, announced only if it
+/// commits.
+///
+/// Publishing inside the transaction announces changes that may still roll
+/// back, and holds the request on the broker while the transaction is open.
+/// Instead, a handler records each event here ([`record`](Self::record)) as
+/// its write succeeds, mirrors its SQL savepoints with
+/// [`savepoint`](Self::savepoint) / [`rollback_to`](Self::rollback_to) /
+/// [`release`](Self::release), and calls [`commit`](Self::commit) once, after
+/// the *outermost* database commit succeeded.
+///
+/// - A savepoint release keeps its events (they belong to the enclosing
+///   transaction); a rollback to a savepoint drops only the events recorded
+///   after it.
+/// - Dropping the value, or calling [`rollback`](Self::rollback), without
+///   committing discards everything, which is what a transaction that ends
+///   without a commit must do.
+/// - Delivery is best effort ([`EventBus::publish`]): a crash between the
+///   database commit and [`commit`](Self::commit) loses the events, and a
+///   client that needs completeness refetches on reconnect.
+#[derive(Debug, Default)]
+pub struct PendingEvents {
+    events: Vec<CrudEvent>,
+    /// The id and the number of events recorded when each open savepoint was
+    /// taken.
+    marks: Vec<(u64, usize)>,
+    /// The id of the next savepoint, so a stale handle never matches a newer
+    /// savepoint that reuses its depth.
+    next_id: u64,
+}
+
+/// A position in a [`PendingEvents`], returned by
+/// [`savepoint`](PendingEvents::savepoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Savepoint {
+    depth: usize,
+    id: u64,
+}
+
+impl PendingEvents {
+    /// An empty queue for a new transaction.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an event of the current transaction.
+    pub fn record(&mut self, event: CrudEvent) {
+        self.events.push(event);
+    }
+
+    /// The events recorded so far, oldest first.
+    #[must_use]
+    pub fn events(&self) -> &[CrudEvent] {
+        &self.events
+    }
+
+    /// Mirror `SAVEPOINT`: remember where the queue stands.
+    pub fn savepoint(&mut self) -> Savepoint {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.marks.push((id, self.events.len()));
+        Savepoint {
+            depth: self.marks.len() - 1,
+            id,
+        }
+    }
+
+    /// Mirror `RELEASE SAVEPOINT`: the savepoint and any taken after it are
+    /// gone, and their events stay in the transaction. A savepoint that is
+    /// already gone changes nothing.
+    pub fn release(&mut self, savepoint: Savepoint) {
+        if self.is_open(savepoint) {
+            self.marks.truncate(savepoint.depth);
+        }
+    }
+
+    /// Mirror `ROLLBACK TO SAVEPOINT`: drop the events recorded since the
+    /// savepoint. Savepoints taken after it are gone; it stays usable, as in
+    /// SQL. A savepoint that is already gone changes nothing.
+    pub fn rollback_to(&mut self, savepoint: Savepoint) {
+        if self.is_open(savepoint) {
+            self.events.truncate(self.marks[savepoint.depth].1);
+            self.marks.truncate(savepoint.depth + 1);
+        }
+    }
+
+    /// Whether `savepoint` is still the savepoint it was taken as.
+    fn is_open(&self, savepoint: Savepoint) -> bool {
+        self.marks
+            .get(savepoint.depth)
+            .is_some_and(|&(id, _)| id == savepoint.id)
+    }
+
+    /// The transaction rolled back: discard every event. (Dropping the value
+    /// does the same.)
+    pub fn rollback(self) {
+        drop(self);
+    }
+
+    /// The outermost commit succeeded: publish every event, in order, with
+    /// [`EventBus::publish_all`]. Open savepoints are part of the commit.
+    ///
+    /// Delivery runs inside the returned future, so a future that is dropped
+    /// part way (a client disconnect cancelling the handler) loses the events
+    /// not yet sent. A host that must deliver every event should run this in
+    /// a spawned task.
+    pub async fn commit(self, bus: &EventBus) {
+        bus.publish_all(self.events).await;
+    }
+}
+
 /// One subscriber's live event feed. Dropping it disconnects that
 /// subscriber's MQTT session -- which the broker keeps (and queues into)
-/// because the session is persistent -- and frees its anonymous-connection
-/// slot.
+/// when the session is persistent -- and frees its anonymous-connection and
+/// stream-limit slots.
 pub struct EventStream {
     inner: Inner,
     _permit: Option<AnonymousPermit>,
+    _slot: Option<StreamSlot>,
 }
 
 enum Inner {
@@ -1040,6 +1906,17 @@ impl EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh random secret, so no credential is a literal in the tests.
+    fn random_secret() -> String {
+        use std::fmt::Write as _;
+        let mut bytes = [0u8; 20];
+        getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
+        bytes.iter().fold(String::new(), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
+    }
 
     #[test]
     fn topic_is_namespaced_under_the_crud_events_root() {
@@ -1287,6 +2164,7 @@ mod tests {
                 backlog: VecDeque::new(),
             },
             _permit: None,
+            _slot: None,
         }
     }
 
@@ -1359,52 +2237,10 @@ mod tests {
 
     #[cfg(feature = "mqtt")]
     #[tokio::test]
-    async fn a_publish_the_client_cannot_queue_is_logged_not_propagated() {
-        // Dropping the event loop closes the client's request channel, so
-        // every publish fails to queue.
-        let options = MqttOptions::new("test-publisher", "localhost", 1883);
-        let (publisher, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
-        drop(eventloop);
-        let bus = EventBus::with_backend(Backend::Mqtt {
-            host: "localhost".to_string(),
-            port: 1883,
-            publisher,
-            session_ttl: None,
-        });
-        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
-            .await;
-    }
-
-    #[cfg(feature = "mqtt")]
-    #[tokio::test]
-    async fn a_publish_the_client_can_queue_succeeds_without_a_broker() {
-        // The event loop is kept (and never polled), so the request channel
-        // stays open and the publish queues.
-        let options = MqttOptions::new("test-publisher", "localhost", 1);
-        let (publisher, _eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
-        let bus = EventBus::with_backend(Backend::Mqtt {
-            host: "localhost".to_string(),
-            port: 1,
-            publisher,
-            session_ttl: None,
-        });
-        bus.publish(CrudEvent::new("widgets", EventAction::Create, vec![1]))
-            .await;
-    }
-
-    #[cfg(feature = "mqtt")]
-    #[tokio::test]
     async fn subscribing_while_the_broker_is_down_is_an_error() {
         // Nothing listens on port 1: the connection is refused, which must
         // surface here (-> 503) and not as a stream that never delivers.
-        let options = MqttOptions::new("test-publisher", "localhost", 1);
-        let (publisher, _eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
-        let bus = EventBus::with_backend(Backend::Mqtt {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            publisher,
-            session_ttl: None,
-        });
+        let bus = EventBus::connect("127.0.0.1", 1).without_session_ttl();
         let err = bus.subscribe("widgets", None).await.err().unwrap();
         assert!(matches!(err, EventError::Broker(_)), "{err}");
         // The failed attempt gave its anonymous slot back.
@@ -1535,6 +2371,7 @@ mod tests {
                 backlog: VecDeque::new(),
             },
             _permit: None,
+            _slot: None,
         };
         assert_eq!(stream.next_event().await.unwrap().ids, vec![4]);
     }
@@ -1554,6 +2391,7 @@ mod tests {
                 backlog: VecDeque::from([buffered]),
             },
             _permit: None,
+            _slot: None,
         };
         assert_eq!(stream.next_event().await.unwrap().ids, vec![1]);
         assert_eq!(stream.next_event().await.unwrap().ids, vec![2]);
@@ -1601,6 +2439,7 @@ mod tests {
                 backlog: VecDeque::new(),
             },
             _permit: None,
+            _slot: None,
         };
         assert_eq!(stream.next_event().await.unwrap().ids, vec![4]);
 
@@ -1654,31 +2493,12 @@ mod tests {
         .await;
     }
 
-    /// A value whose JSON encoding always fails.
-    #[cfg(feature = "mqtt")]
-    struct Unencodable;
-
-    #[cfg(feature = "mqtt")]
-    impl serde::Serialize for Unencodable {
-        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-            Err(serde::ser::Error::custom("cannot encode"))
-        }
-    }
-
     #[cfg(feature = "mqtt")]
     fn client_with_closed_request_channel() -> AsyncClient {
         let options = MqttOptions::new("test-closed", "localhost", 1883);
         let (client, eventloop) = AsyncClient::new(options, CHANNEL_CAPACITY);
         drop(eventloop);
         client
-    }
-
-    #[cfg(feature = "mqtt")]
-    #[tokio::test]
-    async fn publish_json_reports_an_encoding_failure() {
-        let client = client_with_closed_request_channel();
-        let err = publish_json(&client, "t".to_string(), &Unencodable).unwrap_err();
-        assert!(err.contains("cannot encode"), "{err}");
     }
 
     #[cfg(feature = "mqtt")]
@@ -1715,36 +2535,20 @@ mod tests {
     #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn a_session_ttl_is_kept_whole_seconds_on_the_mqtt_bus() {
-        let (publisher, _eventloop) =
-            AsyncClient::new(MqttOptions::new("test-publisher", "localhost", 1), 1);
-        let bus = EventBus::with_backend(Backend::Mqtt {
-            host: "localhost".to_string(),
-            port: 1,
-            publisher,
-            session_ttl: None,
-        })
-        .with_session_ttl(Duration::from_millis(3_600_999));
-        assert!(matches!(
-            bus.backend,
-            Backend::Mqtt {
-                session_ttl: Some(3600),
-                ..
-            }
-        ));
+        let bus = EventBus::connect("localhost", 1).without_session_ttl();
+        assert_eq!(bus.mqtt().unwrap().session_ttl, None);
+        let bus = bus.with_session_ttl(Duration::from_millis(3_600_999));
+        assert_eq!(bus.mqtt().unwrap().session_ttl, Some(3600));
+        // The default is the documented hour.
+        let bus = EventBus::connect("localhost", 1);
+        assert_eq!(bus.mqtt().unwrap().session_ttl, Some(3600));
+        assert_eq!(DEFAULT_SESSION_TTL, Duration::from_secs(3600));
     }
 
     #[cfg(feature = "mqtt")]
     #[tokio::test]
     async fn a_v5_durable_subscribe_while_the_broker_is_down_is_an_error() {
-        let (publisher, _eventloop) =
-            AsyncClient::new(MqttOptions::new("test-publisher", "localhost", 1), 1);
-        let bus = EventBus::with_backend(Backend::Mqtt {
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            publisher,
-            session_ttl: None,
-        })
-        .with_session_ttl(Duration::from_secs(60));
+        let bus = EventBus::connect("127.0.0.1", 1).with_session_ttl(Duration::from_secs(60));
         let err = bus.subscribe("widgets", None).await.err().unwrap();
         assert!(matches!(err, EventError::Broker(_)), "{err}");
     }
@@ -1816,5 +2620,525 @@ mod tests {
         let client = SubscriberClient::V5(client);
         assert!(client.subscribe("t".to_string()).await.is_err());
         assert!(client.try_subscribe("t".to_string()).is_err());
+    }
+
+    fn widget_event(id: i32) -> CrudEvent {
+        CrudEvent::new("widgets", EventAction::Create, vec![id])
+    }
+
+    #[tokio::test]
+    async fn streams_are_capped_per_caller_across_resources_and_freed_on_drop() {
+        let bus = EventBus::mock().with_max_streams_per_caller(Some(2));
+        let (_, first) = bus
+            .subscribe_for_caller("alice", "widgets", None)
+            .await
+            .unwrap();
+        let (_, _second) = bus
+            .subscribe_for_caller("alice", "gadgets", None)
+            .await
+            .unwrap();
+        let err = bus
+            .subscribe_for_caller("alice", "widgets", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, EventError::TooManyStreams), "{err}");
+        // Another caller has its own budget.
+        let (_, _bob) = bus
+            .subscribe_for_caller("bob", "widgets", None)
+            .await
+            .unwrap();
+        // Dropping a stream frees its slot.
+        drop(first);
+        assert!(
+            bus.subscribe_for_caller("alice", "widgets", None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_cap_refusal_takes_no_stream_slot() {
+        let bus = EventBus::mock()
+            .with_max_streams_per_caller(Some(1))
+            .with_max_anonymous_connections(0);
+        // The anonymous cap refuses first; the caller's slot must not leak.
+        assert!(
+            bus.subscribe_for_caller("alice", "widgets", None)
+                .await
+                .is_err()
+        );
+        assert!(bus.stream_counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streams_are_capped_per_subscriber_id() {
+        let bus = EventBus::mock()
+            .with_durable_streams()
+            .with_max_streams_per_subscriber(Some(1));
+        let (id, _held) = bus
+            .subscribe_for_caller("alice", "widgets", None)
+            .await
+            .unwrap();
+        // Another caller presenting the same id is over the id's own limit.
+        let err = bus
+            .subscribe_for_caller("bob", "widgets", Some(&id))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, EventError::TooManyStreams), "{err}");
+        // The refused attempt left nothing behind for bob.
+        assert!(
+            bus.subscribe_for_caller("bob", "widgets", None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stream_limits_can_be_removed() {
+        let bus = EventBus::mock()
+            .with_max_streams_per_caller(None)
+            .with_max_streams_per_subscriber(None);
+        let mut held = Vec::new();
+        for _ in 0..(DEFAULT_MAX_STREAMS_PER_CALLER + 2) {
+            held.push(
+                bus.subscribe_for_caller("alice", "widgets", None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(held.len(), DEFAULT_MAX_STREAMS_PER_CALLER + 2);
+    }
+
+    #[tokio::test]
+    async fn the_default_limits_are_five_per_caller_and_two_per_subscriber() {
+        let bus = EventBus::mock().with_durable_streams();
+        assert!(bus.durable_streams());
+        assert!(!EventBus::mock().durable_streams());
+        assert_eq!(bus.max_streams_per_caller, Some(5));
+        assert_eq!(bus.max_streams_per_subscriber, Some(2));
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(
+                bus.subscribe_for_caller("alice", "widgets", None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            bus.subscribe_for_caller("alice", "widgets", None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streams_are_transient_unless_the_host_opts_into_durable_ones() {
+        let transient = EventBus::mock();
+        let issued = transient.mint_subscriber_id("widgets");
+        let (id, _stream) = transient
+            .subscribe_for_caller("alice", "widgets", Some(&issued))
+            .await
+            .unwrap();
+        assert_ne!(id, issued, "a transient stream ignores the presented id");
+
+        let durable = EventBus::mock().with_durable_streams();
+        let issued = durable.mint_subscriber_id("widgets");
+        let (id, _stream) = durable
+            .subscribe_for_caller("alice", "widgets", Some(&issued))
+            .await
+            .unwrap();
+        assert_eq!(id, issued);
+    }
+
+    #[tokio::test]
+    async fn pending_events_are_published_in_order_only_on_commit() {
+        let bus = EventBus::mock();
+        let (_, mut stream) = bus.subscribe("widgets", None).await.unwrap();
+        let mut pending = PendingEvents::new();
+        pending.record(widget_event(1));
+        pending.record(widget_event(2));
+        assert_eq!(pending.events().len(), 2);
+        assert_eq!(bus.delivery_stats(), DeliveryStats::default());
+        pending.commit(&bus).await;
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![1]);
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![2]);
+        assert_eq!(bus.delivery_stats().published, 2);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_that_ends_without_a_commit_publishes_nothing() {
+        let bus = EventBus::mock();
+        let mut dropped = PendingEvents::new();
+        dropped.record(widget_event(1));
+        drop(dropped);
+        let mut rolled_back = PendingEvents::new();
+        rolled_back.record(widget_event(2));
+        rolled_back.rollback();
+        assert_eq!(bus.delivery_stats(), DeliveryStats::default());
+    }
+
+    #[tokio::test]
+    async fn a_savepoint_rollback_drops_only_its_own_events() {
+        let bus = EventBus::mock();
+        let (_, mut stream) = bus.subscribe("widgets", None).await.unwrap();
+        let mut pending = PendingEvents::new();
+        pending.record(widget_event(1));
+        let outer = pending.savepoint();
+        pending.record(widget_event(2));
+        let inner = pending.savepoint();
+        pending.record(widget_event(3));
+        // Releasing the inner savepoint keeps its event in the outer one.
+        pending.release(inner);
+        pending.record(widget_event(4));
+        // Rolling back the outer savepoint drops everything since it.
+        pending.rollback_to(outer);
+        pending.record(widget_event(5));
+        // A stale savepoint changes nothing.
+        pending.rollback_to(inner);
+        pending.release(inner);
+        assert_eq!(
+            pending
+                .events()
+                .iter()
+                .map(|event| event.ids[0])
+                .collect::<Vec<_>>(),
+            vec![1, 5]
+        );
+        // The rolled-back savepoint is still usable, as in SQL.
+        pending.rollback_to(outer);
+        assert_eq!(pending.events().len(), 1);
+        pending.commit(&bus).await;
+        assert_eq!(stream.next_event().await.unwrap().ids, vec![1]);
+        assert_eq!(bus.delivery_stats().published, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_later_events_and_counts_them() {
+        let bus = EventBus::mock();
+        bus.publish(widget_event(1)).await;
+        bus.shutdown().await;
+        bus.publish(widget_event(2)).await;
+        bus.shutdown().await;
+        assert_eq!(
+            bus.delivery_stats(),
+            DeliveryStats {
+                published: 1,
+                failed: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_publish_in_flight_but_only_so_long() {
+        let bus = EventBus::mock();
+        let held = bus.track().unwrap();
+        // The publish never finishes, so the bounded wait gives up.
+        bus.shutdown().await;
+        drop(held);
+        assert!(bus.track().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_debug_output_hides_the_secrets() {
+        let secret = random_secret();
+        let bus = EventBus::mock().with_subscriber_secret(secret.clone().into_bytes());
+        let shown = format!("{bus:?}");
+        // No message: a failing assert must not print the formatted bus.
+        assert!(shown.contains("mock") && shown.contains("<redacted>"));
+        assert!(!shown.contains(&secret));
+        assert!(bus.validate().is_ok());
+        #[cfg(feature = "mqtt")]
+        assert!(bus.mqtt().is_none());
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn mqtt_credentials_are_refused_without_tls_unless_allowed() {
+        let password = random_secret();
+        let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_credentials("alice", &password);
+        let err = bus.validate().unwrap_err();
+        assert!(
+            matches!(&err, EventError::Config(msg) if msg.contains("without TLS")),
+            "{err}"
+        );
+        // The password is redacted from Debug, the user name is not.
+        let shown = format!("{bus:?}");
+        assert!(shown.contains("alice") && shown.contains("<redacted>"));
+        assert!(!shown.contains(&password));
+        // Both ways to open a connection fail closed, and a publish is counted.
+        bus.publish(widget_event(1)).await;
+        assert_eq!(bus.delivery_stats().failed, 1);
+        let err = bus.subscribe("widgets", None).await.err().unwrap();
+        assert!(matches!(err, EventError::Config(_)), "{err}");
+
+        let insecure = bus.with_mqtt_allow_insecure();
+        assert!(insecure.validate().is_ok());
+        // Allowed: the connection is attempted (and refused by nothing listening).
+        let err = insecure.subscribe("widgets", None).await.err().unwrap();
+        assert!(matches!(err, EventError::Broker(_)), "{err}");
+        let err = insecure
+            .without_session_ttl()
+            .subscribe("widgets", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, EventError::Broker(_)), "{err}");
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn the_mqtt_settings_are_ignored_by_the_in_memory_bus() {
+        let bus = EventBus::mock()
+            .with_mqtt_credentials("alice", random_secret())
+            .with_mqtt_allow_insecure()
+            .without_session_ttl();
+        assert!(bus.validate().is_ok());
+        bus.publish(widget_event(1)).await;
+        assert_eq!(bus.delivery_stats().published, 1);
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn the_mqtt_publisher_is_opened_once_and_shared() {
+        let bus = EventBus::connect("127.0.0.1", 1);
+        // Shutting down before anything was published has nothing to close.
+        bus.shutdown().await;
+        let bus = EventBus::connect("127.0.0.1", 1);
+        let mqtt = bus.mqtt().unwrap();
+        let (_, first) = mqtt.shared_client().await.unwrap();
+        let (_, again) = mqtt.shared_client().await.unwrap();
+        assert_eq!(first, again);
+        bus.publish(widget_event(1)).await;
+        bus.publish_all(vec![widget_event(2), widget_event(3)])
+            .await;
+        // Queued for a broker that is not there: counted as published.
+        assert_eq!(bus.delivery_stats().published, 3);
+        bus.shutdown().await;
+        assert!(mqtt.publisher_slot().is_none());
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_publish_that_times_out_discards_the_shared_connection() {
+        // Nothing listens on port 1, so the request queue is never drained and
+        // fills up; the publish that finds it full times out.
+        let bus = EventBus::connect("127.0.0.1", 1);
+        let mqtt = bus.mqtt().unwrap();
+        let (_, before) = mqtt.shared_client().await.unwrap();
+        for id in 0..500 {
+            bus.publish(widget_event(id)).await;
+            if bus.delivery_stats().failed > 0 {
+                break;
+            }
+        }
+        assert_eq!(bus.delivery_stats().failed, 1);
+        assert!(
+            mqtt.publisher_slot().is_none(),
+            "the connection is discarded"
+        );
+        // The next publish opens a fresh connection.
+        bus.publish(widget_event(1)).await;
+        let (_, after) = mqtt.shared_client().await.unwrap();
+        assert!(after > before);
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_cancelled_publish_discards_the_shared_connection() {
+        let bus = EventBus::connect("127.0.0.1", 1);
+        let mqtt = bus.mqtt().unwrap();
+        let (_, generation) = mqtt.shared_client().await.unwrap();
+        let guard = DiscardGuard {
+            backend: mqtt,
+            generation,
+            armed: true,
+        };
+        drop(guard);
+        assert!(mqtt.publisher_slot().is_none());
+        // A guard for a connection that is already replaced leaves the new one.
+        let (_, current) = mqtt.shared_client().await.unwrap();
+        mqtt.discard(current + 100);
+        assert!(mqtt.publisher_slot().is_some());
+        // A disarmed guard does nothing.
+        let guard = DiscardGuard {
+            backend: mqtt,
+            generation: current,
+            armed: false,
+        };
+        drop(guard);
+        assert!(mqtt.publisher_slot().is_some());
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn a_publish_on_a_dead_connection_is_counted_and_replaces_it() {
+        let bus = EventBus::connect("127.0.0.1", 1);
+        let mqtt = bus.mqtt().unwrap();
+        mqtt.shared_client().await.unwrap();
+        // Stopping the driver drops the event loop, which closes the queue.
+        mqtt.publisher_slot().as_ref().unwrap().task.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bus.publish(widget_event(1)).await;
+        assert_eq!(bus.delivery_stats().failed, 1);
+        assert!(mqtt.publisher_slot().is_none());
+        bus.publish(widget_event(2)).await;
+        assert_eq!(bus.delivery_stats().published, 1);
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[tokio::test]
+    async fn stream_slots_are_freed_when_the_broker_refuses_the_connection() {
+        let bus = EventBus::connect("127.0.0.1", 1).with_max_streams_per_caller(Some(1));
+        for _ in 0..2 {
+            let err = bus
+                .subscribe_for_caller("alice", "widgets", None)
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, EventError::Broker(_)), "{err}");
+        }
+        assert!(bus.stream_counts.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    fn pem_file(name: &str, contents: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("craftainer-crud-events-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// A throwaway self-signed certificate and its PKCS#8 PEM key, made when
+    /// the test runs so no key material lives in the repository.
+    #[cfg(feature = "mqtt-tls")]
+    fn self_signed() -> (Vec<u8>, Vec<u8>) {
+        use openssl::asn1::Asn1Time;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::hash::MessageDigest;
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509, X509NameBuilder};
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "test").unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        (
+            builder.build().to_pem().unwrap(),
+            key.private_key_to_pem_pkcs8().unwrap(),
+        )
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    #[tokio::test]
+    async fn tls_credentials_and_client_auth_reach_every_connection() {
+        let (cert_pem, key_pem) = self_signed();
+        // A bundle of two certificates, with a trailing newline.
+        let bundle = [cert_pem.clone(), cert_pem.clone()].concat();
+        let ca = pem_file("ca.pem", &bundle);
+        let cert = pem_file("client.pem", &cert_pem);
+        let key = pem_file("client.key", &key_pem);
+        let tls = MqttTls::new(&ca).with_client_auth(&cert, &key);
+        assert_eq!(tls, tls.clone());
+        let bus = EventBus::connect("127.0.0.1", 1)
+            .with_mqtt_tls(tls)
+            .with_mqtt_credentials("alice", random_secret());
+        // TLS satisfies the credentials rule.
+        assert!(bus.validate().is_ok());
+        // The shared publisher is built with the transport and login.
+        bus.publish(widget_event(1)).await;
+        assert_eq!(bus.delivery_stats().published, 1);
+        // So is a v5 durable subscriber (the default) and a v3 one; the
+        // refused connection is a broker error, not a configuration one.
+        let err = bus.subscribe("widgets", None).await.err().unwrap();
+        assert!(matches!(err, EventError::Broker(_)), "{err}");
+        let err = bus
+            .without_session_ttl()
+            .subscribe("widgets", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, EventError::Broker(_)), "{err}");
+        assert!(
+            format!("{:?}", EventBus::mock().with_mqtt_tls(MqttTls::new(&ca))).contains("mock")
+        );
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    #[tokio::test]
+    async fn tls_without_client_auth_builds_a_transport_from_the_ca_alone() {
+        let (cert_pem, _) = self_signed();
+        let ca = pem_file("ca.pem", &cert_pem);
+        let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(MqttTls::new(&ca));
+        bus.publish(widget_event(1)).await;
+        assert_eq!(bus.delivery_stats().published, 1);
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    #[tokio::test]
+    async fn an_unreadable_tls_file_fails_closed_with_a_config_error() {
+        let (cert_pem, key_pem) = self_signed();
+        let ca = pem_file("ca.pem", &cert_pem);
+        let cert = pem_file("client.pem", &cert_pem);
+        let key = pem_file("client.key", &key_pem);
+        let missing = ca.with_file_name("missing.pem");
+        for tls in [
+            MqttTls::new(&missing),
+            MqttTls::new(&ca).with_client_auth(&missing, &key),
+            MqttTls::new(&ca).with_client_auth(&cert, &missing),
+        ] {
+            let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(tls);
+            let err = bus.subscribe("widgets", None).await.err().unwrap();
+            assert!(
+                matches!(&err, EventError::Config(msg) if msg.contains("missing.pem")),
+                "{err}"
+            );
+            bus.publish(widget_event(1)).await;
+            assert_eq!(bus.delivery_stats().failed, 1);
+        }
+    }
+
+    #[cfg(feature = "mqtt-tls")]
+    #[tokio::test]
+    async fn malformed_tls_material_fails_closed_with_a_config_error() {
+        let (cert_pem, key_pem) = self_signed();
+        let good_ca = pem_file("ca.pem", &cert_pem);
+        let junk = pem_file("junk.pem", b"not a certificate");
+        let truncated = pem_file(
+            "truncated.pem",
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        );
+        let key = pem_file("client.key", &key_pem);
+        for tls in [
+            // No certificate at all, a certificate that does not parse, and
+            // a client certificate or key that does not parse.
+            MqttTls::new(&junk),
+            MqttTls::new(&truncated),
+            MqttTls::new(&good_ca).with_client_auth(&junk, &key),
+            MqttTls::new(&good_ca).with_client_auth(&good_ca, &junk),
+        ] {
+            let bus = EventBus::connect("127.0.0.1", 1).with_mqtt_tls(tls);
+            let err = bus.subscribe("widgets", None).await.err().unwrap();
+            assert!(
+                matches!(&err, EventError::Config(msg) if msg.contains("invalid TLS configuration")),
+                "{err}"
+            );
+        }
     }
 }

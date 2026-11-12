@@ -49,6 +49,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
 hmac = "0.13.0"
+native-tls = { version = "0.2.12", optional = true }
 rumqttc = { version = "0.25.1", default-features = false, optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -60,6 +61,9 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 jsonschema = { version = "0.60.1", default-features = false }
+# Makes the throwaway certificates of the `mqtt-tls` unit tests; native-tls
+# already links it on Linux.
+openssl = "0.10.82"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "derive"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
@@ -68,6 +72,13 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 # Off by default, like the Python package's extra: the in-memory event bus
 # needs no broker. `mqtt` adds the Mosquitto-backed bus (`EventBus::connect`).
 mqtt = ["dep:rumqttc", "tokio/rt"]
+# `mqtt-tls` adds TLS to that bus (rumqttc over native-tls, i.e. the system
+# OpenSSL: building needs pkg-config and libssl-dev, running needs libssl3):
+# `EventBus::with_mqtt_tls`. rumqttc's rustls feature is not used because it
+# pulls `rustls-webpki` 0.102 and `rustls-pemfile`, which carry open advisories.
+# Credentials work without it, but are refused over plaintext unless the host
+# opts in.
+mqtt-tls = ["mqtt", "rumqttc/use-native-tls", "dep:native-tls", "tokio/fs"]
 
 [lints]
 workspace = true

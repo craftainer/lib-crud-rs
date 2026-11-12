@@ -104,10 +104,18 @@ pub trait StatsCache: Send + Sync {
 /// The default [`MemoryStatsCache`] time to live.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
 
-/// A process-local [`StatsCache`] whose entries expire after a time to live.
+/// The default [`MemoryStatsCache`] entry cap.
+pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
+/// A process-local [`StatsCache`] whose entries expire after a time to live
+/// and whose size is bounded.
 ///
-/// There is no size bound: expired entries are dropped on any `set`, when
-/// read, and on `invalidate`.
+/// Expired entries are dropped on any `set`, when read, and on `invalidate`.
+/// The cache never holds more than its cap ([`DEFAULT_MAX_ENTRIES`] unless
+/// [`with_max_entries`](Self::with_max_entries) says otherwise): a `set` of a
+/// new key at the cap first evicts the entry that was stored longest ago, so
+/// a caller who varies a query parameter cannot grow the process without
+/// bound.
 ///
 /// Meant for a single instance, tests and development; replicas behind a load
 /// balancer need a shared store, which the host supplies by implementing
@@ -115,6 +123,7 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct MemoryStatsCache {
     ttl: Duration,
+    max_entries: usize,
     entries: Mutex<HashMap<(String, String), (Instant, Value)>>,
 }
 
@@ -130,8 +139,17 @@ impl MemoryStatsCache {
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             ttl,
+            max_entries: DEFAULT_MAX_ENTRIES,
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keep at most `max` entries (default [`DEFAULT_MAX_ENTRIES`]); a value
+    /// below one is raised to one.
+    #[must_use]
+    pub fn with_max_entries(mut self, max: usize) -> Self {
+        self.max_entries = max.max(1);
+        self
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), (Instant, Value)>> {
@@ -166,10 +184,19 @@ impl StatsCache for MemoryStatsCache {
         // Drop every expired entry first, so keys that are never read again
         // (distinct query params) cannot pile up.
         entries.retain(|_, (stored_at, _)| stored_at.elapsed() < self.ttl);
-        entries.insert(
-            (resource.to_owned(), key.to_owned()),
-            (Instant::now(), value),
-        );
+        let slot = (resource.to_owned(), key.to_owned());
+        if entries.len() >= self.max_entries && !entries.contains_key(&slot) {
+            // Bound the map: make room by dropping the oldest entry. Only
+            // reached at the cap, so the scan is not on the common path.
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, (stored_at, _))| *stored_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(slot, (Instant::now(), value));
         Ok(())
     }
 
