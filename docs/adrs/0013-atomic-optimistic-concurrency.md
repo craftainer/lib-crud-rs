@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Amends [0008](0008-conditional-requests.md). Mirrors the same change in
+Proposed. Amends [0008](0008-conditional-requests.md). Mirrors the same change in
 `lib-crud-py`. A breaking release (0.x minor).
 
 ## Context
@@ -30,7 +30,8 @@ one-way digest of `<id>:<updated_at>`, so it cannot itself be a SQL predicate.
   is not revealed by a different status); the record exists at another version is the new
   `RepoError::VersionConflict` (now `#[non_exhaustive]`), which converts to the existing
   `CrudError::PreconditionFailed` (412). Telling them apart may use a second read after the
-  failed write; it only classifies, it does not guard.
+  failed write; it only classifies, it does not guard, and a row changed between the two
+  statements can be reported as the other outcome (best effort, never a lost update).
 - An implementation moves `updated_at` on every successful write, soft delete and bulk
   writes included, at a resolution that separates two writes.
 - `CrudService::update`/`delete`, `resolve_update`, `resolve_update_by_id` and
@@ -40,7 +41,10 @@ one-way digest of `<id>:<updated_at>`, so it cannot itself be a SQL predicate.
   argument: the same strong comparison as `check_if_match`; a matching tag gives
   `Some(record.updated_at())`; an absent header or `*` gives `None`; anything else is the
   same 412 as before. It takes the resource name (as `check_if_match` does) so the 412
-  `detail` text is unchanged.
+  `detail` text is unchanged when the stale tag is caught up front. A conflict only found
+  at write time (`RepoError::VersionConflict`) becomes a 412 with the generic detail
+  "record was modified since the supplied If-Match", because the conversion has no resource
+  name: same status and problem type, different `detail`.
 - HTTP behaviour is otherwise unchanged: a stale or weak `If-Match` is 412, a missing
   `If-Match` passes (no 428), `*` matches any existing record.
 - `dyn_repository!` forwards the new argument and the crate re-exports `chrono` for it.
