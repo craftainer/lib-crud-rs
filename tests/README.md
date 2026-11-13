@@ -6,7 +6,11 @@ a dependent would, and runs against the devcontainer's backing services.
 - `postgres_crud.rs` — the generic layer end to end against Postgres
   (`POSTGRES_*`), through the plain-`sqlx` `widgets` repository in
   `support/`. Each test opens a single-connection pool and a `TEMP` table, so
-  tests run in parallel without seeing each other's rows.
+  tests run in parallel without seeing each other's rows. It includes the
+  `expected_version` races (two writers with one version, exactly one wins);
+  the single-connection pool serializes the statements, so the race is
+  interleaved at the `await` points and a check-then-write implementation
+  would let both through.
 - `mqtt_events.rs` — the event bus against a real Mosquitto
   (`MQTT_HOST`/`MQTT_PORT`). Needs the `mqtt` feature (`required-features`
   in `Cargo.toml`). It is the only place the persistent-session delivery

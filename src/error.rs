@@ -151,7 +151,12 @@ impl IntoResponse for CrudError {
 
 impl From<RepoError> for CrudError {
     fn from(err: RepoError) -> Self {
-        Self::Internal(err.to_string())
+        match err {
+            RepoError::VersionConflict => Self::PreconditionFailed(
+                "record was modified since the supplied If-Match".to_string(),
+            ),
+            RepoError::Backend(_) => Self::Internal(err.to_string()),
+        }
     }
 }
 
@@ -259,5 +264,14 @@ mod tests {
         let repo_err = RepoError::Backend("connection reset".to_string());
         let app_err: CrudError = repo_err.into();
         assert!(matches!(app_err, CrudError::Internal(msg) if msg.contains("connection reset")));
+    }
+
+    #[test]
+    fn a_version_conflict_converts_to_precondition_failed() {
+        let app_err: CrudError = RepoError::VersionConflict.into();
+        assert!(matches!(
+            app_err,
+            CrudError::PreconditionFailed(msg) if msg.contains("modified since")
+        ));
     }
 }

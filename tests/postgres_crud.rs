@@ -266,7 +266,7 @@ async fn updates_are_scoped_to_the_owner() {
     };
 
     let UpdateOutcome::One(updated) =
-        resolve_update(&service, Some(alices), "alice", vec![], patch(), 10)
+        resolve_update(&service, Some(alices), "alice", None, vec![], patch(), 10)
             .await
             .unwrap()
     else {
@@ -275,7 +275,7 @@ async fn updates_are_scoped_to_the_owner() {
     assert_eq!((updated.name.as_str(), updated.quantity), ("renamed", 3));
 
     // Bob cannot touch alice's record.
-    let err = resolve_update_by_id(&service, alices, "bob", patch())
+    let err = resolve_update_by_id(&service, alices, "bob", None, patch())
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::NotFound(_)));
@@ -290,24 +290,24 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
     };
 
     // No id and no filter: refused.
-    let err = resolve_update(&service, None, "alice", vec![], patch(), 10)
+    let err = resolve_update(&service, None, "alice", None, vec![], patch(), 10)
         .await
         .err()
         .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_delete(&service, None, "alice", vec![], 10, true)
+    let err = resolve_delete(&service, None, "alice", None, vec![], 10, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
 
     // Over the cap: refused.
     let wide = filters(&[("quantity__min", "0")]);
-    let err = resolve_update(&service, None, "alice", wide.clone(), patch(), 2)
+    let err = resolve_update(&service, None, "alice", None, wide.clone(), patch(), 2)
         .await
         .err()
         .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_delete(&service, None, "alice", wide, 2, true)
+    let err = resolve_delete(&service, None, "alice", None, wide, 2, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
@@ -317,6 +317,7 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
         &service,
         None,
         "alice",
+        None,
         filters(&[("quantity__min", "0")]),
         patch(),
         10,
@@ -338,6 +339,7 @@ async fn bulk_update_and_delete_are_capped_scoped_and_need_a_target() {
         &service,
         None,
         "alice",
+        None,
         filters(&[("quantity", "100")]),
         10,
         true,
@@ -391,12 +393,20 @@ async fn an_id_together_with_filters_is_refused_before_anything_runs() {
     .err()
     .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_update(&service, Some(id), "alice", guard.clone(), patch(), 10)
-        .await
-        .err()
-        .unwrap();
+    let err = resolve_update(
+        &service,
+        Some(id),
+        "alice",
+        None,
+        guard.clone(),
+        patch(),
+        10,
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
-    let err = resolve_delete(&service, Some(id), "alice", guard, 10, true)
+    let err = resolve_delete(&service, Some(id), "alice", None, guard, 10, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
@@ -415,20 +425,20 @@ async fn deleting_soft_deletes_and_hides_the_record() {
     let id = all[0].id;
 
     // Bob cannot delete alice's record.
-    let err = resolve_delete(&service, Some(id), "bob", vec![], 10, true)
+    let err = resolve_delete(&service, Some(id), "bob", None, vec![], 10, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::NotFound(_)));
 
     assert!(matches!(
-        resolve_delete(&service, Some(id), "alice", vec![], 10, true)
+        resolve_delete(&service, Some(id), "alice", None, vec![], 10, true)
             .await
             .unwrap(),
         DeleteOutcome::One
     ));
     // Already archived: a second delete finds nothing.
     assert!(matches!(
-        resolve_delete(&service, Some(id), "alice", vec![], 10, true)
+        resolve_delete(&service, Some(id), "alice", None, vec![], 10, true)
             .await
             .unwrap_err(),
         CrudError::NotFound(_)
@@ -456,7 +466,7 @@ async fn only_archived_lists_and_counts_just_the_archived_rows() {
     let id = all[0].id;
     let doomed = all[1].id;
     for victim in [id, doomed] {
-        resolve_delete(&service, Some(victim), "alice", vec![], 10, true)
+        resolve_delete(&service, Some(victim), "alice", None, vec![], 10, true)
             .await
             .unwrap();
     }
@@ -513,7 +523,7 @@ async fn resolve_list_or_get_only_archived_lists_archived_and_refuses_an_id() {
         .await
         .unwrap();
     let id = all[0].id;
-    resolve_delete(&service, Some(id), "alice", vec![], 10, true)
+    resolve_delete(&service, Some(id), "alice", None, vec![], 10, true)
         .await
         .unwrap();
 
@@ -587,14 +597,14 @@ async fn dyn_repository_forwards_every_method() {
         quantity: None,
     };
     let updated = repo
-        .update(created.id, "alice", patch.clone())
+        .update(created.id, "alice", None, patch.clone())
         .await
         .unwrap();
     assert_eq!(updated.unwrap().name, "a2");
     let many = repo.update_many(&[by_name("b")], patch).await.unwrap();
     assert_eq!(many.len(), 1);
 
-    assert!(repo.delete(created.id, "alice").await.unwrap());
+    assert!(repo.delete(created.id, "alice", None).await.unwrap());
     let deleted = repo.delete_many(&[by_name("a2")], true).await.unwrap();
     assert_eq!(deleted.len(), 1);
 }
@@ -614,11 +624,24 @@ async fn a_lost_database_surfaces_as_internal_from_every_resolver() {
     assert_internal(
         resolve_list_or_get(&crud, None, 0, 10, ArchivedScope::Live, vec![], vec![]).await,
     );
-    assert_internal(resolve_update(&crud, Some(1), "o", vec![], WidgetPatch::default(), 10).await);
-    assert_internal(resolve_update(&crud, None, "o", target(), WidgetPatch::default(), 10).await);
-    assert_internal(resolve_update_by_id(&crud, 1, "o", WidgetPatch::default()).await);
-    assert_internal(resolve_delete(&crud, Some(1), "o", vec![], 10, true).await);
-    assert_internal(resolve_delete(&crud, None, "o", target(), 10, true).await);
+    assert_internal(
+        resolve_update(
+            &crud,
+            Some(1),
+            "o",
+            None,
+            vec![],
+            WidgetPatch::default(),
+            10,
+        )
+        .await,
+    );
+    assert_internal(
+        resolve_update(&crud, None, "o", None, target(), WidgetPatch::default(), 10).await,
+    );
+    assert_internal(resolve_update_by_id(&crud, 1, "o", None, WidgetPatch::default()).await);
+    assert_internal(resolve_delete(&crud, Some(1), "o", None, vec![], 10, true).await);
+    assert_internal(resolve_delete(&crud, None, "o", None, target(), 10, true).await);
 }
 
 #[tokio::test]
@@ -627,8 +650,10 @@ async fn a_bulk_write_failing_after_the_size_check_is_internal_too() {
     crud.create("o", NewWidget::new("a", 1)).await.unwrap();
     let target = || filters(&[("quantity__min", "0")]);
 
-    assert_internal(resolve_update(&crud, None, "o", target(), WidgetPatch::default(), 10).await);
-    assert_internal(resolve_delete(&crud, None, "o", target(), 10, true).await);
+    assert_internal(
+        resolve_update(&crud, None, "o", None, target(), WidgetPatch::default(), 10).await,
+    );
+    assert_internal(resolve_delete(&crud, None, "o", None, target(), 10, true).await);
 }
 
 #[tokio::test]
@@ -644,7 +669,7 @@ async fn a_bulk_delete_spares_scheduled_rows_and_the_cap_counts_what_it_reaches(
     let all_alice = filters(&[("quantity__min", "0")]);
 
     // The default (true) reaches the scheduled row, so three rows are over a cap of two.
-    let err = resolve_delete(&service, None, "alice", all_alice.clone(), 2, true)
+    let err = resolve_delete(&service, None, "alice", None, all_alice.clone(), 2, true)
         .await
         .unwrap_err();
     assert!(matches!(err, CrudError::UnprocessableEntity(_)));
@@ -658,7 +683,7 @@ async fn a_bulk_delete_spares_scheduled_rows_and_the_cap_counts_what_it_reaches(
         2
     );
     let DeleteOutcome::Bulk(result) =
-        resolve_delete(&service, None, "alice", all_alice.clone(), 2, false)
+        resolve_delete(&service, None, "alice", None, all_alice.clone(), 2, false)
             .await
             .unwrap()
     else {
@@ -671,11 +696,270 @@ async fn a_bulk_delete_spares_scheduled_rows_and_the_cap_counts_what_it_reaches(
     );
 
     // Then `true` takes the scheduled row too.
-    let DeleteOutcome::Bulk(result) = resolve_delete(&service, None, "alice", all_alice, 2, true)
-        .await
-        .unwrap()
+    let DeleteOutcome::Bulk(result) =
+        resolve_delete(&service, None, "alice", None, all_alice, 2, true)
+            .await
+            .unwrap()
     else {
         panic!("expected a bulk result");
     };
     assert_eq!(result.matched, 1);
+}
+
+/// Alice's single widget "w" and its current version.
+async fn one_widget() -> (CrudService<PgWidgets>, Widget) {
+    let service = CrudService::new(PgWidgets::connect().await);
+    let widget = service
+        .create("alice", NewWidget::new("w", 1))
+        .await
+        .unwrap();
+    (service, widget)
+}
+
+fn rename(name: &str) -> WidgetPatch {
+    WidgetPatch {
+        name: Some(name.to_string()),
+        quantity: None,
+    }
+}
+
+fn if_match(value: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("if-match", value.parse().unwrap());
+    headers
+}
+
+#[tokio::test]
+async fn two_updates_with_the_same_expected_version_let_exactly_one_win() {
+    let (service, widget) = one_widget().await;
+    let version = Some(widget.updated_at);
+
+    let (first, second) = tokio::join!(
+        service.update(widget.id, "alice", version, rename("first")),
+        service.update(widget.id, "alice", version, rename("second")),
+    );
+
+    let outcomes = [first, second];
+    let winners = outcomes.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    let conflicts = outcomes
+        .iter()
+        .filter(|r| matches!(r, Err(RepoError::VersionConflict)))
+        .count();
+    assert_eq!((winners, conflicts), (1, 1), "{outcomes:?}");
+
+    let winner = outcomes
+        .into_iter()
+        .find_map(Result::unwrap_or_default)
+        .unwrap();
+    let stored = service.get(widget.id, false).await.unwrap().unwrap();
+    assert_eq!(stored.name, winner.name);
+    assert_ne!(stored.updated_at, widget.updated_at);
+}
+
+#[tokio::test]
+async fn a_stale_expected_version_is_a_412_and_writes_nothing() {
+    let (service, widget) = one_widget().await;
+    let stale = widget.updated_at;
+    resolve_update_by_id(&service, widget.id, "alice", Some(stale), rename("fresh"))
+        .await
+        .unwrap();
+
+    let err = resolve_update_by_id(&service, widget.id, "alice", Some(stale), rename("stale"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::PreconditionFailed(_)), "{err:?}");
+    let stored = service.get(widget.id, false).await.unwrap().unwrap();
+    assert_eq!(stored.name, "fresh");
+}
+
+#[tokio::test]
+async fn a_delete_with_a_stale_expected_version_is_a_412_and_deletes_nothing() {
+    let (service, widget) = one_widget().await;
+    let stale = widget.updated_at;
+    service
+        .update(widget.id, "alice", None, rename("fresh"))
+        .await
+        .unwrap();
+
+    let err = resolve_delete(
+        &service,
+        Some(widget.id),
+        "alice",
+        Some(stale),
+        vec![],
+        10,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CrudError::PreconditionFailed(_)), "{err:?}");
+    assert!(service.get(widget.id, false).await.unwrap().is_some());
+
+    // The current version deletes.
+    let current = service.get(widget.id, false).await.unwrap().unwrap();
+    assert!(matches!(
+        resolve_delete(
+            &service,
+            Some(widget.id),
+            "alice",
+            Some(current.updated_at),
+            vec![],
+            10,
+            true
+        )
+        .await
+        .unwrap(),
+        DeleteOutcome::One
+    ));
+    assert!(service.get(widget.id, false).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn two_deletes_with_the_same_expected_version_let_exactly_one_win() {
+    let (service, widget) = one_widget().await;
+    let version = Some(widget.updated_at);
+
+    let (first, second) = tokio::join!(
+        service.delete(widget.id, "alice", version),
+        service.delete(widget.id, "alice", version),
+    );
+
+    // The loser sees either a conflict or (once the row is archived) nothing
+    // to delete, never a second success.
+    let outcomes = [first, second];
+    let winners = outcomes.iter().filter(|r| matches!(r, Ok(true))).count();
+    assert_eq!(winners, 1, "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .all(|r| r.is_ok() || matches!(r, Err(RepoError::VersionConflict))),
+        "{outcomes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_or_foreign_record_stays_a_404_even_with_an_expected_version() {
+    let (service, widget) = one_widget().await;
+    let version = Some(widget.updated_at);
+
+    // Someone else's record: not found, not a conflict, so ownership is not
+    // revealed through the status.
+    let err = resolve_update_by_id(&service, widget.id, "bob", version, rename("x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::NotFound(_)), "{err:?}");
+    let err = resolve_delete(&service, Some(widget.id), "bob", version, vec![], 10, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::NotFound(_)), "{err:?}");
+
+    let err = resolve_update_by_id(&service, 99_999, "alice", version, rename("x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::NotFound(_)), "{err:?}");
+
+    // Archived: gone, whatever the version.
+    service.delete(widget.id, "alice", None).await.unwrap();
+    let err = resolve_update_by_id(&service, widget.id, "alice", version, rename("x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::NotFound(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn none_is_an_unconditional_write_whatever_changed_since() {
+    let (service, widget) = one_widget().await;
+    service
+        .update(widget.id, "alice", None, rename("a"))
+        .await
+        .unwrap();
+    let updated = service
+        .update(widget.id, "alice", None, rename("b"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.name, "b");
+    assert!(service.delete(widget.id, "alice", None).await.unwrap());
+}
+
+#[tokio::test]
+async fn every_write_moves_the_version() {
+    let (service, widget) = one_widget().await;
+    let first = service
+        .update(widget.id, "alice", Some(widget.updated_at), rename("a"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.updated_at > widget.updated_at);
+    let second = service
+        .update(widget.id, "alice", Some(first.updated_at), rename("b"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second.updated_at > first.updated_at);
+}
+
+#[tokio::test]
+async fn if_match_drives_the_write_end_to_end() {
+    use craftainer_crud::conditional::{expected_version, record_etag};
+
+    let (service, widget) = one_widget().await;
+    let tag = record_etag(&widget);
+
+    // Current tag: the write goes through, conditional on that version.
+    let version = expected_version(&if_match(&tag), &widget, "Widget").unwrap();
+    assert_eq!(version, Some(widget.updated_at));
+    let updated = resolve_update_by_id(&service, widget.id, "alice", version, rename("a"))
+        .await
+        .unwrap();
+    assert_ne!(record_etag(&updated), tag);
+
+    // The same tag again (a second client that read before the first write):
+    // the handler's own check now fails against the fresh record ...
+    let err = expected_version(&if_match(&tag), &updated, "Widget").unwrap_err();
+    assert!(matches!(err, CrudError::PreconditionFailed(_)));
+    // ... and a handler that read before the write but writes after still
+    // loses atomically inside the repository.
+    let err = resolve_update_by_id(&service, widget.id, "alice", version, rename("b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CrudError::PreconditionFailed(_)));
+
+    // No header and `*`: unconditional.
+    assert_eq!(
+        expected_version(&axum::http::HeaderMap::new(), &updated, "Widget").unwrap(),
+        None
+    );
+    assert_eq!(
+        expected_version(&if_match("*"), &updated, "Widget").unwrap(),
+        None
+    );
+    // A weak tag never matches.
+    let weak = format!("W/{}", record_etag(&updated));
+    assert!(expected_version(&if_match(&weak), &updated, "Widget").is_err());
+}
+
+#[tokio::test]
+async fn bulk_actions_ignore_the_expected_version() {
+    let service = seeded().await;
+    let stale = Some(
+        chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+    );
+    let UpdateOutcome::Bulk(result) = resolve_update(
+        &service,
+        None,
+        "alice",
+        stale,
+        filters(&[("quantity__min", "0")]),
+        rename("bulk"),
+        10,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected a bulk result");
+    };
+    assert_eq!(result.matched, 3);
 }

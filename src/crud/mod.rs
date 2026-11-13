@@ -4,6 +4,8 @@
 //! the page-size limits ([`DEFAULT_LIMIT`], [`MAX_LIMIT`]) and the owner
 //! scoping of bulk actions; everything else is a pass-through.
 
+use chrono::NaiveDateTime;
+
 use crate::repositories::filtering::{FilterClause, FilterOp, FilterValue, SortClause};
 use crate::repositories::{ListOptions, RepoError, Repository};
 
@@ -101,17 +103,24 @@ where
     }
 
     /// Update record `id`, scoped to `owner_id`; `None` when no row matched.
+    /// With `expected_version` `Some(v)` the repository writes only if the
+    /// record's `updated_at` is still `v` (atomically); `None` writes
+    /// unconditionally.
     ///
     /// # Errors
     ///
-    /// [`RepoError`] when the backend fails.
+    /// [`RepoError::VersionConflict`] when the record exists at another
+    /// version; [`RepoError::Backend`] when the backend fails.
     pub async fn update(
         &self,
         id: i32,
         owner_id: &str,
+        expected_version: Option<NaiveDateTime>,
         data: R::Update,
     ) -> Result<Option<R::Model>, RepoError> {
-        self.repository.update(id, owner_id, data).await
+        self.repository
+            .update(id, owner_id, expected_version, data)
+            .await
     }
 
     /// Apply `data` to every non-archived record matching `filters`,
@@ -134,13 +143,20 @@ where
             .await
     }
 
-    /// Soft-delete record `id`, scoped to `owner_id`; `false` when no row matched.
+    /// Soft-delete record `id`, scoped to `owner_id`; `false` when no row
+    /// matched. `expected_version` is as for [`update`](Self::update).
     ///
     /// # Errors
     ///
-    /// [`RepoError`] when the backend fails.
-    pub async fn delete(&self, id: i32, owner_id: &str) -> Result<bool, RepoError> {
-        self.repository.delete(id, owner_id).await
+    /// [`RepoError::VersionConflict`] when the record exists at another
+    /// version; [`RepoError::Backend`] when the backend fails.
+    pub async fn delete(
+        &self,
+        id: i32,
+        owner_id: &str,
+        expected_version: Option<NaiveDateTime>,
+    ) -> Result<bool, RepoError> {
+        self.repository.delete(id, owner_id, expected_version).await
     }
 
     /// Soft-delete every non-archived record matching `filters`, scoped to
@@ -188,6 +204,8 @@ mod tests {
         list_opts: Mutex<Option<ListOptions>>,
         count_filters: Mutex<Option<Vec<FilterClause>>>,
         count_include_unpublished: Mutex<Option<bool>>,
+        update_expected: Mutex<Vec<Option<NaiveDateTime>>>,
+        delete_expected: Mutex<Vec<Option<NaiveDateTime>>>,
         update_many_filters: Mutex<Option<Vec<FilterClause>>>,
         delete_many_filters: Mutex<Option<Vec<FilterClause>>>,
         delete_many_include_unpublished: Mutex<Option<bool>>,
@@ -228,8 +246,10 @@ mod tests {
             &self,
             id: i32,
             _owner_id: &str,
+            expected_version: Option<NaiveDateTime>,
             _data: i32,
         ) -> Result<Option<i32>, RepoError> {
+            self.update_expected.lock().unwrap().push(expected_version);
             Ok(Some(id))
         }
 
@@ -242,7 +262,13 @@ mod tests {
             Ok(vec![data])
         }
 
-        async fn delete(&self, _id: i32, _owner_id: &str) -> Result<bool, RepoError> {
+        async fn delete(
+            &self,
+            _id: i32,
+            _owner_id: &str,
+            expected_version: Option<NaiveDateTime>,
+        ) -> Result<bool, RepoError> {
+            self.delete_expected.lock().unwrap().push(expected_version);
             Ok(true)
         }
 
@@ -343,8 +369,30 @@ mod tests {
         let service = CrudService::new(FakeRepository::default());
         assert_eq!(service.get(1, false).await.unwrap(), Some(1));
         assert_eq!(service.create("owner", 9).await.unwrap(), 9);
-        assert_eq!(service.update(2, "owner", 3).await.unwrap(), Some(2));
-        assert!(service.delete(1, "owner").await.unwrap());
+        assert_eq!(service.update(2, "owner", None, 3).await.unwrap(), Some(2));
+        assert!(service.delete(1, "owner", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_pass_the_expected_version_through() {
+        let service = CrudService::new(FakeRepository::default());
+        let version = chrono::NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .and_hms_micro_opt(3, 4, 5, 6)
+            .unwrap();
+        service.update(1, "o", Some(version), 0).await.unwrap();
+        service.delete(1, "o", Some(version)).await.unwrap();
+        service.update(1, "o", None, 0).await.unwrap();
+        service.delete(1, "o", None).await.unwrap();
+        let expected = vec![Some(version), None];
+        assert_eq!(
+            *service.repository.update_expected.lock().unwrap(),
+            expected
+        );
+        assert_eq!(
+            *service.repository.delete_expected.lock().unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]

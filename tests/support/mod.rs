@@ -22,12 +22,19 @@ pub struct Widget {
     pub name: String,
     pub quantity: i64,
     pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
     pub archived_at: Option<NaiveDateTime>,
 }
 
 impl craftainer_crud::models::HasId for Widget {
     fn id(&self) -> i32 {
         self.id
+    }
+}
+
+impl craftainer_crud::conditional::Versioned for Widget {
+    fn updated_at(&self) -> NaiveDateTime {
+        self.updated_at
     }
 }
 
@@ -97,6 +104,7 @@ impl PgWidgets {
                 name TEXT NOT NULL,
                 quantity BIGINT NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP NOT NULL DEFAULT (clock_timestamp() AT TIME ZONE 'utc'),
                 archived_at TIMESTAMP,
                 publish_at TIMESTAMP
             )",
@@ -121,6 +129,27 @@ impl PgWidgets {
         .execute(&self.pool)
         .await
         .expect("schedule the widget");
+    }
+
+    /// After a conditional write matched no row: a live row of this owner that
+    /// still exists means the version differed (a conflict); none means the
+    /// record is missing, not owned or archived (the caller's `None`/`false`).
+    /// Only classifies a failure that already happened; the write itself was
+    /// atomic.
+    async fn fail_if_live(&self, id: i32, owner_id: &str) -> Result<(), RepoError> {
+        let live: Option<(i32,)> = sqlx::query_as(
+            "SELECT id FROM widgets WHERE id = $1 AND owner_id = $2 AND archived_at IS NULL",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| backend(&err))?;
+        if live.is_some() {
+            Err(RepoError::VersionConflict)
+        } else {
+            Ok(())
+        }
     }
 
     /// Close the pool, so every later call fails like a lost database.
@@ -316,19 +345,29 @@ impl Repository for PgWidgets {
         &self,
         id: i32,
         owner_id: &str,
+        expected_version: Option<NaiveDateTime>,
         data: WidgetPatch,
     ) -> Result<Option<Widget>, RepoError> {
-        sqlx::query_as::<_, Widget>(
-            "UPDATE widgets SET name = COALESCE($1, name), quantity = COALESCE($2, quantity) \
-             WHERE id = $3 AND owner_id = $4 AND archived_at IS NULL RETURNING *",
+        // One statement: the version predicate is part of the write, so there
+        // is no read-then-write gap. `$5 IS NULL` is the unconditional opt-out.
+        let updated = sqlx::query_as::<_, Widget>(
+            "UPDATE widgets SET name = COALESCE($1, name), quantity = COALESCE($2, quantity), \
+             updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') \
+             WHERE id = $3 AND owner_id = $4 AND archived_at IS NULL \
+             AND ($5::timestamp IS NULL OR updated_at = $5) RETURNING *",
         )
         .bind(data.name)
         .bind(data.quantity)
         .bind(id)
         .bind(owner_id)
+        .bind(expected_version)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|err| backend(&err))
+        .map_err(|err| backend(&err))?;
+        if updated.is_none() && expected_version.is_some() {
+            self.fail_if_live(id, owner_id).await?;
+        }
+        Ok(updated)
     }
 
     async fn update_many(
@@ -344,7 +383,10 @@ impl Repository for PgWidgets {
             .push_bind(data.name)
             .push(", name), quantity = COALESCE(")
             .push_bind(data.quantity)
-            .push(", quantity) WHERE archived_at IS NULL");
+            .push(
+                ", quantity), updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') \
+                 WHERE archived_at IS NULL",
+            );
         push_filters(&mut builder, filters)?;
         builder.push(" RETURNING *");
         builder
@@ -354,16 +396,27 @@ impl Repository for PgWidgets {
             .map_err(|err| backend(&err))
     }
 
-    async fn delete(&self, id: i32, owner_id: &str) -> Result<bool, RepoError> {
+    async fn delete(
+        &self,
+        id: i32,
+        owner_id: &str,
+        expected_version: Option<NaiveDateTime>,
+    ) -> Result<bool, RepoError> {
         let result = sqlx::query(
-            "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc' \
-             WHERE id = $1 AND owner_id = $2 AND archived_at IS NULL",
+            "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc', \
+             updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') \
+             WHERE id = $1 AND owner_id = $2 AND archived_at IS NULL \
+             AND ($3::timestamp IS NULL OR updated_at = $3)",
         )
         .bind(id)
         .bind(owner_id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await
         .map_err(|err| backend(&err))?;
+        if result.rows_affected() == 0 && expected_version.is_some() {
+            self.fail_if_live(id, owner_id).await?;
+        }
         Ok(result.rows_affected() > 0)
     }
 
@@ -376,7 +429,8 @@ impl Repository for PgWidgets {
             return Err(RepoError::Backend("read-only".to_string()));
         }
         let mut builder = QueryBuilder::new(
-            "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc' WHERE archived_at IS NULL",
+            "UPDATE widgets SET archived_at = now() AT TIME ZONE 'utc', \
+             updated_at = GREATEST(clock_timestamp() AT TIME ZONE 'utc', updated_at + interval '1 microsecond') WHERE archived_at IS NULL",
         );
         if !include_unpublished {
             builder.push(PUBLISHED_ONLY);

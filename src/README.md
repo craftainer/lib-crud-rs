@@ -16,7 +16,8 @@ this list, except `error`, which `conditional`, `controllers`, `events` and
 - `views/` — `FieldError`, bulk-result and stats/predict response shapes.
 - `crud/` — `CrudService<R>`, generic over any repository.
 - `conditional.rs` — `Versioned`, entity-tags, `If-None-Match` and `If-Match`
-  helpers (imports `models` and `error`).
+  helpers (`expected_version` turns `If-Match` into the repository's
+  `expected_version`) (imports `models` and `error`).
 - `stats_cache.rs` — the opt-in `/stats` and `/predict` response cache:
   `StatsCache`, `MemoryStatsCache`, `CachedStats`, `cache_key` (imports `error`
   only).

@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted. Follows [0004](0004-crud-manifest.md), which left `conditional_requests`
-off "until this crate implements them", and mirrors `lib-crud-py`'s `crud_router.py`.
+Accepted. Amended by [0013](0013-atomic-optimistic-concurrency.md): the check-then-write
+gap noted under Consequences is closed by `expected_version`. Follows
+[0004](0004-crud-manifest.md), which left `conditional_requests` off "until this crate implements them", and mirrors `lib-crud-py`'s `crud_router.py`.
 
 ## Context
 

@@ -21,13 +21,18 @@
 //! - [`check_if_match`]: `If-Match` with *strong* comparison, so a stale tag
 //!   (or a weak one, which can never match) is [`CrudError::PreconditionFailed`],
 //!   a `412` problem response. `*` matches any existing record.
+//! - [`expected_version`]: the same `If-Match` check, turned into the
+//!   `expected_version` (`Some(updated_at)` when a tag matched, `None` for an
+//!   absent header or `*`) that a repository's `update`/`delete` checks
+//!   atomically with the write, so two writers holding the same tag cannot
+//!   both succeed (ADR 0013 in the repository's `docs/adrs/`).
 //!
 //! A typical handler:
 //!
 //! ```
 //! use axum::http::{HeaderMap, StatusCode};
 //! use chrono::NaiveDateTime;
-//! use craftainer_crud::conditional::{Versioned, check_if_match, not_modified, record_etag};
+//! use craftainer_crud::conditional::{Versioned, expected_version, not_modified, record_etag};
 //! use craftainer_crud::models::HasId;
 //!
 //! struct Widget { id: i32, updated_at: NaiveDateTime }
@@ -43,10 +48,13 @@
 //! let response = not_modified(&request, &etag).expect("the tag is current");
 //! assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 //!
-//! // PATCH or DELETE: the precondition holds, so the write goes ahead.
+//! // PATCH or DELETE: the precondition holds, so the write goes ahead, and
+//! // the repository applies it only if the row is still at this version.
 //! let mut request = HeaderMap::new();
 //! request.insert("if-match", etag.parse().unwrap());
-//! check_if_match(&request, &etag, "Widget").expect("the tag is current");
+//! let version = expected_version(&request, &widget, "Widget").expect("the tag is current");
+//! assert_eq!(version, Some(widget.updated_at));
+//! // repository.update(id, owner, version, patch).await ...
 //! ```
 //!
 //! [`Features::conditional_requests`]: crate::manifest::Features::conditional_requests
@@ -218,7 +226,9 @@ pub fn not_modified(req_headers: &HeaderMap, etag: &str) -> Option<Response> {
 /// call this only once the record was found and let a missing one fall
 /// through to the write's own `404`. The check and the write are separate
 /// statements: this closes the read-modify-write window a client holds open,
-/// not a race inside the gap between them.
+/// not a race inside the gap between them. To close that gap too, use
+/// [`expected_version`] and hand its result to the repository's `update` or
+/// `delete`, which then check the version atomically with the write.
 ///
 /// # Errors
 ///
@@ -229,18 +239,75 @@ pub fn check_if_match(
     current_etag: &str,
     resource: &str,
 ) -> Result<(), CrudError> {
+    if_match(req_headers, current_etag, resource).map(|_| ())
+}
+
+/// How a passing `If-Match` matched.
+enum IfMatched {
+    /// No `If-Match` header.
+    Absent,
+    /// Only `*` matched.
+    Star,
+    /// A strong tag equal to the current one matched.
+    Tag,
+}
+
+/// The one `If-Match` matcher behind [`check_if_match`] and
+/// [`expected_version`], so the two cannot drift apart.
+fn if_match(
+    req_headers: &HeaderMap,
+    current_etag: &str,
+    resource: &str,
+) -> Result<IfMatched, CrudError> {
     if !req_headers.contains_key(IF_MATCH) {
-        return Ok(());
+        return Ok(IfMatched::Absent);
     }
-    let matches = entity_tags(req_headers, &IF_MATCH)
-        .into_iter()
-        .any(|tag| tag == "*" || (!is_weak(tag) && tag == current_etag));
-    if matches {
-        Ok(())
+    let tags = entity_tags(req_headers, &IF_MATCH);
+    if tags
+        .iter()
+        .any(|&tag| !is_weak(tag) && tag != "*" && tag == current_etag)
+    {
+        Ok(IfMatched::Tag)
+    } else if tags.contains(&"*") {
+        Ok(IfMatched::Star)
     } else {
         Err(CrudError::PreconditionFailed(format!(
             "{resource} was modified since the supplied If-Match"
         )))
+    }
+}
+
+/// The `expected_version` to give a repository's `update` or `delete` for
+/// one record, from the request's `If-Match` and the record as just read.
+///
+/// The `If-Match` check is [`check_if_match`]'s (strong comparison, `W/` tags
+/// never match, a header with no matching tag is
+/// [`CrudError::PreconditionFailed`], `412`). What it returns on success:
+///
+/// - `Some(record.updated_at())` when a tag matched the record's [`record_etag`]:
+///   the write is then conditional on the row still being at that version,
+///   checked atomically by the repository;
+/// - `None` when the header is absent, or only `*` matched (any existing
+///   record): the write is unconditional, as before.
+///
+/// Typical single-record handler: read the record, `let v = expected_version(&headers,
+/// &record, "Widget")?`, then `update(id, owner, v, patch)`. A write that finds
+/// the record changed in between is a `412` too
+/// ([`RepoError::VersionConflict`](crate::repositories::RepoError::VersionConflict)).
+/// A missing record has no tag, so call this only once it was found.
+///
+/// # Errors
+///
+/// [`CrudError::PreconditionFailed`] when `If-Match` is present and matches
+/// neither the record's tag nor `*`.
+pub fn expected_version<T: Versioned>(
+    req_headers: &HeaderMap,
+    record: &T,
+    resource: &str,
+) -> Result<Option<NaiveDateTime>, CrudError> {
+    match if_match(req_headers, &record_etag(record), resource)? {
+        IfMatched::Tag => Ok(Some(record.updated_at())),
+        IfMatched::Absent | IfMatched::Star => Ok(None),
     }
 }
 
@@ -493,6 +560,55 @@ mod tests {
         ));
         // `*` still matches an existing record with a weak current tag.
         assert!(check_if_match(&headers("if-match", &["*"]), &weak_current, "W").is_ok());
+    }
+
+    #[test]
+    fn expected_version_is_none_without_the_header() {
+        assert_eq!(
+            expected_version(&HeaderMap::new(), &widget(1, 0), "Widget").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn expected_version_is_the_updated_at_of_a_matching_strong_tag() {
+        let record = widget(1, 7);
+        let etag = record_etag(&record);
+        let got = expected_version(&headers("if-match", &[&etag]), &record, "Widget").unwrap();
+        assert_eq!(got, Some(record.updated_at));
+        let list = format!("\"old\", {etag}");
+        let got = expected_version(&headers("if-match", &[&list]), &record, "Widget").unwrap();
+        assert_eq!(got, Some(record.updated_at));
+    }
+
+    #[test]
+    fn expected_version_is_none_for_star() {
+        let record = widget(1, 0);
+        let got = expected_version(&headers("if-match", &["*"]), &record, "Widget").unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn expected_version_prefers_a_matching_tag_over_star() {
+        let record = widget(1, 0);
+        let both = format!("*, {}", record_etag(&record));
+        let got = expected_version(&headers("if-match", &[&both]), &record, "Widget").unwrap();
+        assert_eq!(got, Some(record.updated_at));
+    }
+
+    #[test]
+    fn expected_version_fails_with_412_on_a_stale_weak_or_empty_header() {
+        let record = widget(1, 0);
+        let weak = format!("W/{}", record_etag(&record));
+        for value in ["\"stale\"", weak.as_str(), ""] {
+            let request = headers("if-match", &[value]);
+            let err = expected_version(&request, &record, "Widget").unwrap_err();
+            assert!(
+                matches!(&err, CrudError::PreconditionFailed(msg)
+                    if msg == "Widget was modified since the supplied If-Match"),
+                "{value:?} gave {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -37,6 +37,8 @@
 //! or runs the count and the write in one transaction at its own isolation
 //! level.
 
+use chrono::NaiveDateTime;
+
 use crate::crud::{CrudService, owner_scoped};
 use crate::error::CrudError;
 use crate::models::HasId;
@@ -220,8 +222,16 @@ where
 /// Update one record by id, or bulk-update every record matching the
 /// given filters (scoped to `owner_id`, capped by `max_matched`).
 ///
+/// `expected_version` applies to the `id` path only (a bulk action has no one
+/// representation to compare, so it is ignored there): `Some(v)` writes only
+/// if the record's `updated_at` is still `v`, atomically; `None` writes
+/// unconditionally. A host derives it from `If-Match` with
+/// [`conditional::expected_version`](crate::conditional::expected_version).
+///
 /// # Errors
 ///
+/// [`CrudError::PreconditionFailed`] when the record exists at another
+/// version than `expected_version`;
 /// [`CrudError::NotFound`] when `id` names no record owned by `owner_id`;
 /// [`CrudError::UnprocessableEntity`] when `id` comes with filters, when
 /// neither an id nor a filter was given, or the filters match more than `max_matched` records;
@@ -230,6 +240,7 @@ pub async fn resolve_update<R>(
     crud: &CrudService<R>,
     id: Option<i32>,
     owner_id: &str,
+    expected_version: Option<NaiveDateTime>,
     filters: Vec<FilterClause>,
     data: R::Update,
     max_matched: u64,
@@ -240,7 +251,7 @@ where
 {
     if let Some(id) = id {
         ensure_id_without_filters(&filters)?;
-        let updated = resolve_update_by_id(crud, id, owner_id, data).await?;
+        let updated = resolve_update_by_id(crud, id, owner_id, expected_version, data).await?;
         return Ok(UpdateOutcome::One(updated));
     }
     // update_many has no publish-window flag: it reaches every live row
@@ -256,18 +267,21 @@ where
 ///
 /// # Errors
 ///
+/// [`CrudError::PreconditionFailed`] when the record exists at another
+/// version than `expected_version` (see [`resolve_update`]);
 /// [`CrudError::NotFound`] when `id` names no record owned by `owner_id`;
 /// [`CrudError::Internal`] when the backend fails.
 pub async fn resolve_update_by_id<R>(
     crud: &CrudService<R>,
     id: i32,
     owner_id: &str,
+    expected_version: Option<NaiveDateTime>,
     data: R::Update,
 ) -> Result<R::Model, CrudError>
 where
     R: Repository,
 {
-    let updated = crud.update(id, owner_id, data).await?;
+    let updated = crud.update(id, owner_id, expected_version, data).await?;
     updated.ok_or_else(|| not_found(id))
 }
 
@@ -276,16 +290,18 @@ where
 /// `include_unpublished` applies to the bulk path only: false spares rows
 /// outside their publish window, and the cap counts the rows it selects. A
 /// host passes [`parse_bulk_delete_include_unpublished`](crate::controllers::crud_query::parse_bulk_delete_include_unpublished)
-/// (default true); a delete by id ignores it.
+/// (default true); a delete by id ignores it. `expected_version` is as for
+/// [`resolve_update`]: the `id` path only.
 ///
 /// # Errors
 ///
-/// As [`resolve_update`]: not found, an unbounded or oversized bulk target,
+/// As [`resolve_update`]: a version conflict, not found, an unbounded or oversized bulk target,
 /// or a backend failure.
 pub async fn resolve_delete<R>(
     crud: &CrudService<R>,
     id: Option<i32>,
     owner_id: &str,
+    expected_version: Option<NaiveDateTime>,
     filters: Vec<FilterClause>,
     max_matched: u64,
     include_unpublished: bool,
@@ -296,7 +312,7 @@ where
 {
     if let Some(id) = id {
         ensure_id_without_filters(&filters)?;
-        let deleted = crud.delete(id, owner_id).await?;
+        let deleted = crud.delete(id, owner_id, expected_version).await?;
         if !deleted {
             return Err(not_found(id));
         }
